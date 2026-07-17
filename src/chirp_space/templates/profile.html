@@ -19,17 +19,17 @@
       {% elif module.kind == "links" and module.config.items %}
       <section aria-labelledby="links-title"><h2 id="links-title">Elsewhere</h2><ul class="link-list">{% for link in module.config.items %}<li><a href="{{ link.url }}" rel="me noopener noreferrer">{{ link.label }} <span aria-hidden="true">↗</span></a></li>{% end %}</ul></section>
       {% elif module.kind == "featured" %}
-      <section><h2>Featured</h2><p class="empty-state">A featured story will appear here after publishing ships.</p></section>
+      <section><h2>Featured</h2>{% if featured_content %}<article class="card"><h3><a href="{{ featured_content.path }}">{% if featured_content.item.title %}{{ featured_content.item.title }}{% else %}{{ featured_content.item.source[:80] }}{% endif %}</a></h3><p>{{ featured_content.item.source[:240] }}</p></article>{% else %}<p class="empty-state">Choose a public item in Customize to feature it here.</p>{% endif %}</section>
       {% elif module.kind == "recent_posts" %}
-      <section><h2>Recent posts</h2><p class="empty-state">No public posts yet.</p></section>
+      <section><h2>Recent posts</h2>{% if recent_content %}<ul class="content-links">{% for entry in recent_content[:module.config.limit] %}<li><a href="{{ entry.path }}">{% if entry.item.title %}{{ entry.item.title }}{% else %}{{ entry.item.source[:80] }}{% endif %}</a></li>{% end %}</ul><p><a href="/archive">Browse the archive</a></p>{% else %}<p class="empty-state">No public posts yet.</p>{% endif %}</section>
       {% elif module.kind == "journal" %}
-      <section><h2>Journal</h2><p class="empty-state">No journal entries yet.</p></section>
+      <section><h2>Journal</h2>{% if journal_content %}<ul class="content-links">{% for entry in journal_content[:module.config.limit] %}<li><a href="{{ entry.path }}">{{ entry.item.title }}</a></li>{% end %}</ul><p><a href="/journal">Read the journal</a></p>{% else %}<p class="empty-state">No journal entries yet.</p>{% endif %}</section>
       {% elif module.kind == "photos" %}
-      <section><h2>Photos</h2><p class="empty-state">No public photos yet.</p></section>
+      <section><h2>Photos</h2>{% if photo_content %}<div class="photo-grid">{% for entry in photo_content %}{% if entry.item.media.status == "ready" %}<a href="{{ entry.path }}"><img src="/media/{{ entry.item.media.id }}"{% if entry.item.media.variants %} srcset="{% for variant in entry.item.media.variants %}/media/{{ entry.item.media.id }}/{{ variant.name }} {{ variant.width }}w, {% end %}/media/{{ entry.item.media.id }} {{ entry.item.media.width }}w" sizes="(max-width: 44rem) 50vw, 22rem"{% endif %} width="{{ entry.item.media.width }}" height="{{ entry.item.media.height }}" alt="{{ entry.item.media.alt_text }}" loading="lazy"></a>{% else %}<a class="card" href="{{ entry.path }}">Photo temporarily unavailable: {{ entry.item.media.alt_text }}</a>{% endif %}{% end %}</div><p><a href="/photos">Browse photos</a></p>{% else %}<p class="empty-state">No public photos yet.</p>{% endif %}</section>
       {% elif module.kind == "tags" %}
-      <section><h2>Topics</h2><p class="empty-state">Topics appear after publishing.</p></section>
+      <section><h2>Topics</h2>{% if tag_counts %}<ul class="tag-list">{% for tag, count in tag_counts[:module.config.limit] %}<li><a href="/tags/{{ tag }}">#{{ tag }} ({{ count }})</a></li>{% end %}</ul>{% else %}<p class="empty-state">Topics appear after publishing.</p>{% endif %}</section>
       {% elif module.kind == "guestbook" %}
-      <section><h2>Guestbook</h2><p>{{ module.config.prompt }}</p><p class="empty-state">Guestbook submissions arrive with the publishing slice.</p></section>
+      <section><h2>Guestbook</h2><p>{{ module.config.prompt }}</p>{% if guestbook_entries %}<ul class="guestbook-preview">{% for entry in guestbook_entries[:3] %}<li><strong>{{ entry.display_name }}</strong>: {{ entry.message }}</li>{% end %}</ul>{% endif %}<p><a class="button" href="/guestbook">Read or sign the guestbook</a></p></section>
       {% end %}
     {% end %}
   {% end %}

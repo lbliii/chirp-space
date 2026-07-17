@@ -12,6 +12,7 @@ license = "MIT"
 dependencies = [
     "bengal-chirp[auth,forms,sessions]>=0.10.2,<0.11",
     "cryptography>=46,<47",
+    "pillow>=12.3,<13",
     "psycopg[binary,pool]>=3.2",
 ]
 

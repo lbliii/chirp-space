@@ -14,8 +14,29 @@ profile, and customize it through typed modules and constrained theme tokens.
 - Owner and site UUIDv7 identifiers survive display-name, handle, theme, and domain changes.
 - PostgreSQL is the production contract. SQLite supports local development and restart proof.
 
-Publishing, media, guestbook behavior, relationships, export, deletion, and Railway template
-publication remain deliberately gated by their Chirp backlog issues.
+Export, whole-site deletion, and Railway template publication remain deliberately gated by their
+Chirp backlog issues.
+
+## Publishing and guestbook
+
+The owner publishing surface at `/owner/content` supports short posts, journals, photos, and
+explicit HTTPS links. Every item has an app-owned UUIDv7 permalink, optimistic revision, tags,
+and one of four lifecycle states: `draft`, `local_only`, `public`, or the permanent `deleted`
+tombstone. Ordinary forms provide create, private preview, edit, publish, unpublish, and confirmed
+delete flows; htmx enhances the same handlers and named template blocks.
+
+Visitors can browse type feeds, signed-cursor pagination, year/month archives, tags, bounded local
+search, stable permalinks, and `/feed.xml`. The guestbook is the only anonymous write: submissions
+are honeypot checked, keyed-rate-limited without retaining raw IP addresses, deduplicated, private
+until moderation, and safely rendered as plain text.
+
+Media storage is an app-owned `ObjectStorage` contract with a filesystem adapter for development.
+Untrusted JPEG, PNG, and WebP uploads cross a separate `ImageNormalizer` boundary before storage;
+the production Pillow 12.3 normalizer decodes and re-encodes the full image, removes metadata,
+rejects animation and trailing-data polyglots, applies EXIF orientation, and produces 480 px and
+1280 px responsive variants when useful. Object keys are random, checksums are verified on read,
+missing objects become visible state, and deletion cleanup is idempotent and retryable. Failed
+normalization or storage saves a recoverable draft instead of accepting unprocessed bytes.
 
 ## Federation identity boundary
 
@@ -70,7 +91,8 @@ uv run chirp-space serve
 ```
 
 Open `http://localhost:8000/setup` and use `development-owner-claim-token`. Local state is
-in-memory unless `DATABASE_URL=sqlite:///space.db` is set.
+in-memory unless `DATABASE_URL=sqlite:///space.db` is set. Development media uses
+`.chirp-space/media/`; inject an object-storage adapter before relying on durable production media.
 
 Run the complete quality gate:
 

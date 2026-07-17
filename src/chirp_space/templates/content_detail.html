@@ -1,0 +1,26 @@
+{% extends "layout.html" %}
+{% block title %}{% if content.item.title %}{{ content.item.title }}{% else %}{{ content.item.kind|title }}{% endif %} · {{ state.owner.display_name }}{% end %}
+{% block page_content %}
+{% if message %}<div class="notice" role="status">{{ message }}</div>{% endif %}
+{% if content.item.state == "deleted" %}
+<article class="critical-card"><p class="eyebrow">Stable tombstone</p><h1>This entry was deleted</h1><p>Its identifier remains reserved and will never be reassigned.</p></article>
+{% else %}
+<article class="content-detail">
+  <header class="page-heading">
+    <p class="eyebrow">{{ content.item.kind }} · revision {{ content.item.revision }}</p>
+    <h1>{% if content.item.title %}{{ content.item.title }}{% else %}{{ content.item.source[:80] }}{% endif %}</h1>
+    {% if viewer %}<p><a class="button" href="/owner/content/{{ content.item.id }}/edit">Edit this entry</a></p>{% endif %}
+  </header>
+  {% if content.item.kind == "photo" and content.item.media and content.item.media.status == "ready" %}<img class="hero-photo" src="/media/{{ content.item.media.id }}"{% if content.item.media.variants %} srcset="{% for variant in content.item.media.variants %}/media/{{ content.item.media.id }}/{{ variant.name }} {{ variant.width }}w, {% end %}/media/{{ content.item.media.id }} {{ content.item.media.width }}w" sizes="(max-width: 44rem) 100vw, 68rem"{% endif %} width="{{ content.item.media.width }}" height="{{ content.item.media.height }}" alt="{{ content.item.media.alt_text }}">{% elif content.item.kind == "photo" %}<p class="notice error" role="status">Photo temporarily unavailable. {{ content.item.media.alt_text }}</p>{% endif %}
+  {% if content.item.kind == "link" and content.item.external_url %}<p><a class="button" href="{{ content.item.external_url }}" rel="noopener noreferrer">Open link <span aria-hidden="true">↗</span></a></p>{% endif %}
+  <div class="prose">
+  {% for block in content.blocks %}
+    {% if block.kind == "heading" %}<h2>{% for part in block.lines[0] %}{% if part.href %}<a href="{{ part.href }}" rel="noopener noreferrer">{{ part.text }}</a>{% else %}{{ part.text }}{% endif %}{% end %}</h2>
+    {% elif block.kind == "list" %}<ul>{% for line in block.lines %}<li>{% for part in line %}{% if part.href %}<a href="{{ part.href }}" rel="noopener noreferrer">{{ part.text }}</a>{% else %}{{ part.text }}{% endif %}{% end %}</li>{% end %}</ul>
+    {% else %}<p>{% for line in block.lines %}{% if not loop.first %}<br>{% endif %}{% for part in line %}{% if part.href %}<a href="{{ part.href }}" rel="noopener noreferrer">{{ part.text }}</a>{% else %}{{ part.text }}{% endif %}{% end %}{% end %}</p>{% endif %}
+  {% end %}
+  </div>
+  {% if content.item.tags %}<ul class="tag-list">{% for tag in content.item.tags %}<li><a href="/tags/{{ tag }}">#{{ tag }}</a></li>{% end %}</ul>{% endif %}
+</article>
+{% endif %}
+{% end %}

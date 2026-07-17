@@ -1,0 +1,50 @@
+{% extends "layout.html" %}
+{% block title %}{{ title }} · {{ state.owner.display_name }}{% end %}
+{% block page_content %}
+<header class="page-heading">
+  <p class="eyebrow">Public collection</p>
+  <h1>{{ title }}</h1>
+  <p>Browse stable, owner-published entries. Drafts and local-only items never appear here.</p>
+</header>
+<form class="search-form" method="get" action="{{ current_path }}">
+  <label for="site-search">Search this site</label>
+  <div class="form-row">
+    <input id="site-search" name="q" value="{{ query }}" maxlength="100">
+    <button type="submit">Search</button>
+  </div>
+</form>
+<div class="content-layout">
+  <section aria-label="Published content">
+    {% if content %}
+      <div class="content-feed">
+      {% for entry in content %}
+        <article class="card content-card">
+          <p class="eyebrow">{{ entry.item.kind }} · revision {{ entry.item.revision }}</p>
+          <h2><a href="{{ entry.path }}">{% if entry.item.title %}{{ entry.item.title }}{% else %}{{ entry.item.source[:80] }}{% end %}</a></h2>
+          {% if entry.item.kind == "photo" and entry.item.media and entry.item.media.status == "ready" %}
+            <img src="/media/{{ entry.item.media.id }}"{% if entry.item.media.variants %} srcset="{% for variant in entry.item.media.variants %}/media/{{ entry.item.media.id }}/{{ variant.name }} {{ variant.width }}w, {% end %}/media/{{ entry.item.media.id }} {{ entry.item.media.width }}w" sizes="(max-width: 44rem) 100vw, 60vw"{% endif %} width="{{ entry.item.media.width }}" height="{{ entry.item.media.height }}" alt="{{ entry.item.media.alt_text }}" loading="lazy">
+          {% elif entry.item.kind == "photo" %}<p class="notice error" role="status">Photo temporarily unavailable. {{ entry.item.media.alt_text }}</p>
+          {% endif %}
+          {% if entry.item.kind == "link" and entry.item.external_url %}<p><a href="{{ entry.item.external_url }}" rel="noopener noreferrer">Visit link <span aria-hidden="true">↗</span></a></p>{% endif %}
+          <p>{{ entry.item.source[:240] }}</p>
+          {% if entry.item.tags %}<ul class="tag-list">{% for tag in entry.item.tags %}<li><a href="/tags/{{ tag }}">#{{ tag }}</a></li>{% end %}</ul>{% endif %}
+        </article>
+      {% end %}
+      </div>
+      {% if next_cursor %}<p><a class="button" href="{{ current_path }}?cursor={{ next_cursor }}{% if query %}&amp;q={{ query }}{% endif %}">Older entries</a></p>{% endif %}
+    {% else %}
+      <p class="empty-state">No published entries match this view.</p>
+    {% endif %}
+  </section>
+  <aside class="card" aria-labelledby="browse-title">
+    <h2 id="browse-title">Browse</h2>
+    <nav aria-label="Content types"><ul>
+      <li><a href="/posts">Posts</a></li><li><a href="/journal">Journal</a></li><li><a href="/photos">Photos</a></li><li><a href="/links">Links</a></li>
+    </ul></nav>
+    <h3>Archive</h3>
+    {% if archive %}<ul>{% for year, month, count in archive %}<li><a href="/archive/{{ year }}/{{ month }}">{{ year }}-{{ month }} ({{ count }})</a></li>{% end %}</ul>{% else %}<p>No archive yet.</p>{% endif %}
+    <h3>Topics</h3>
+    {% if tag_counts %}<ul>{% for tag, count in tag_counts %}<li><a href="/tags/{{ tag }}">#{{ tag }} ({{ count }})</a></li>{% end %}</ul>{% else %}<p>No topics yet.</p>{% endif %}
+  </aside>
+</div>
+{% end %}

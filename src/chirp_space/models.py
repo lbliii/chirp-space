@@ -189,3 +189,60 @@ class AudiencePreview:
     visibility: str
     recipient_actor_ids: tuple[str, ...]
     disclosure: str
+
+
+@dataclass(frozen=True, slots=True)
+class MediaVariant:
+    name: str
+    object_key: str
+    media_type: str
+    width: int
+    height: int
+    byte_size: int
+    checksum: str
+
+
+@dataclass(frozen=True, slots=True)
+class MediaAsset:
+    id: str
+    object_key: str
+    media_type: str
+    width: int
+    height: int
+    byte_size: int
+    checksum: str
+    alt_text: str
+    status: str
+    created_at: datetime
+    variants: tuple[MediaVariant, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ContentItem:
+    id: str
+    owner_id: str
+    kind: str
+    state: str
+    title: str
+    source: str
+    external_url: str | None
+    media: MediaAsset | None
+    tags: tuple[str, ...]
+    revision: int
+    created_at: datetime
+    updated_at: datetime
+    published_at: datetime | None
+    deleted_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class GuestbookEntry:
+    id: str
+    display_name: str
+    message: str
+    website_url: str | None
+    status: str
+    abuse_token: str
+    submission_hash: str
+    created_at: datetime
+    moderated_at: datetime | None
