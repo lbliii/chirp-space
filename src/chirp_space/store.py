@@ -11,7 +11,15 @@ from pathlib import Path
 from threading import RLock
 from typing import Protocol
 
-from chirp_space.models import Owner, ProfileModule, SiteSettings, SiteState, Theme
+from chirp_space.models import (
+    FederationKey,
+    InboxReceipt,
+    Owner,
+    ProfileModule,
+    SiteSettings,
+    SiteState,
+    Theme,
+)
 
 SQLITE_MIGRATION = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -64,6 +72,23 @@ CREATE TABLE IF NOT EXISTS owner_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_owner_sessions_active
     ON owner_sessions(owner_id, expires_at, revoked_at);
+CREATE TABLE IF NOT EXISTS federation_keys (
+    id TEXT PRIMARY KEY,
+    public_pem TEXT NOT NULL,
+    encrypted_private_pem BLOB NOT NULL,
+    created_at TEXT NOT NULL,
+    retired_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_key_active
+    ON federation_keys((retired_at IS NULL)) WHERE retired_at IS NULL;
+CREATE TABLE IF NOT EXISTS inbox_receipts (
+    signature_hash TEXT PRIMARY KEY,
+    activity_id TEXT NOT NULL UNIQUE,
+    activity_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    diagnostic TEXT NOT NULL,
+    received_at TEXT NOT NULL
+);
 """
 
 POSTGRES_MIGRATION = (
@@ -117,6 +142,23 @@ POSTGRES_MIGRATION = (
     )""",
     """CREATE INDEX IF NOT EXISTS idx_owner_sessions_active
         ON owner_sessions(owner_id, expires_at, revoked_at)""",
+    """CREATE TABLE IF NOT EXISTS federation_keys (
+        id UUID PRIMARY KEY,
+        public_pem TEXT NOT NULL,
+        encrypted_private_pem BYTEA NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        retired_at TIMESTAMPTZ
+    )""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_key_active
+        ON federation_keys((retired_at IS NULL)) WHERE retired_at IS NULL""",
+    """CREATE TABLE IF NOT EXISTS inbox_receipts (
+        signature_hash TEXT PRIMARY KEY,
+        activity_id TEXT NOT NULL UNIQUE,
+        activity_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        diagnostic TEXT NOT NULL,
+        received_at TIMESTAMPTZ NOT NULL
+    )""",
 )
 
 
@@ -150,6 +192,12 @@ class Store(Protocol):
         modules: Sequence[ProfileModule],
         expected_revision: int,
     ) -> SiteState: ...
+    def active_federation_key(self) -> FederationKey | None: ...
+    def federation_key(self, key_id: str) -> FederationKey | None: ...
+    def create_federation_key(self, key: FederationKey) -> None: ...
+    def rotate_federation_key(self, key: FederationKey, *, retired_at: datetime) -> None: ...
+    def record_inbox_receipt(self, receipt: InboxReceipt) -> bool: ...
+    def inbox_receipts(self) -> tuple[InboxReceipt, ...]: ...
 
 
 class SQLiteStore:
@@ -167,6 +215,10 @@ class SQLiteStore:
             self._connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (1, ?, ?)",
                 ("local identity and customization foundation", _iso(datetime.now(UTC))),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (2, ?, ?)",
+                ("federation identity and inbox receipts", _iso(datetime.now(UTC))),
             )
 
     def close(self) -> None:
@@ -359,6 +411,119 @@ class SQLiteStore:
             ],
         )
 
+    def active_federation_key(self) -> FederationKey | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM federation_keys WHERE retired_at IS NULL ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return FederationKey(
+            id=str(row["id"]),
+            public_pem=str(row["public_pem"]),
+            encrypted_private_pem=bytes(row["encrypted_private_pem"]),
+            created_at=_datetime(row["created_at"]),
+            retired_at=_datetime(row["retired_at"]) if row["retired_at"] else None,
+        )
+
+    def create_federation_key(self, key: FederationKey) -> None:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                if self._connection.execute(
+                    "SELECT 1 FROM federation_keys WHERE retired_at IS NULL"
+                ).fetchone():
+                    raise RuntimeError("An active federation key already exists.")
+                self._connection.execute(
+                    """INSERT INTO federation_keys(
+                        id, public_pem, encrypted_private_pem, created_at, retired_at
+                    ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        key.id,
+                        key.public_pem,
+                        key.encrypted_private_pem,
+                        _iso(key.created_at),
+                        _iso(key.retired_at) if key.retired_at else None,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    def federation_key(self, key_id: str) -> FederationKey | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM federation_keys WHERE id = ?", (key_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return FederationKey(
+            id=str(row["id"]),
+            public_pem=str(row["public_pem"]),
+            encrypted_private_pem=bytes(row["encrypted_private_pem"]),
+            created_at=_datetime(row["created_at"]),
+            retired_at=_datetime(row["retired_at"]) if row["retired_at"] else None,
+        )
+
+    def rotate_federation_key(self, key: FederationKey, *, retired_at: datetime) -> None:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                updated = self._connection.execute(
+                    "UPDATE federation_keys SET retired_at = ? WHERE retired_at IS NULL",
+                    (_iso(retired_at),),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("Federation key rotation requires one active key.")
+                self._connection.execute(
+                    """INSERT INTO federation_keys(
+                        id, public_pem, encrypted_private_pem, created_at, retired_at
+                    ) VALUES (?, ?, ?, ?, NULL)""",
+                    (key.id, key.public_pem, key.encrypted_private_pem, _iso(key.created_at)),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    def record_inbox_receipt(self, receipt: InboxReceipt) -> bool:
+        with self._lock:
+            try:
+                self._connection.execute(
+                    """INSERT INTO inbox_receipts(
+                        signature_hash, activity_id, activity_type, status, diagnostic, received_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        receipt.signature_hash,
+                        receipt.activity_id,
+                        receipt.activity_type,
+                        receipt.status,
+                        receipt.diagnostic,
+                        _iso(receipt.received_at),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def inbox_receipts(self) -> tuple[InboxReceipt, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM inbox_receipts ORDER BY received_at"
+            ).fetchall()
+        return tuple(
+            InboxReceipt(
+                signature_hash=str(row["signature_hash"]),
+                activity_id=str(row["activity_id"]),
+                activity_type=str(row["activity_type"]),
+                status=str(row["status"]),
+                diagnostic=str(row["diagnostic"]),
+                received_at=_datetime(row["received_at"]),
+            )
+            for row in rows
+        )
+
 
 class PostgresStore:
     """Production PostgreSQL adapter with transactional single-owner setup."""
@@ -376,6 +541,11 @@ class PostgresStore:
                 """INSERT INTO schema_migrations(version, name) VALUES (1, %s)
                 ON CONFLICT (version) DO NOTHING""",
                 ("local identity and customization foundation",),
+            )
+            connection.execute(
+                """INSERT INTO schema_migrations(version, name) VALUES (2, %s)
+                ON CONFLICT (version) DO NOTHING""",
+                ("federation identity and inbox receipts",),
             )
 
     def close(self) -> None:
@@ -534,6 +704,98 @@ class PostgresStore:
             raise RuntimeError("Customization update removed the Space owner state.")
         return result
 
+    def active_federation_key(self) -> FederationKey | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM federation_keys WHERE retired_at IS NULL ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return FederationKey(
+            id=str(row[0]),
+            public_pem=str(row[1]),
+            encrypted_private_pem=bytes(row[2]),
+            created_at=_datetime(row[3]),
+            retired_at=_datetime(row[4]) if row[4] else None,
+        )
+
+    def create_federation_key(self, key: FederationKey) -> None:
+        with self._pool.connection() as connection, connection.transaction():
+            connection.execute("SELECT pg_advisory_xact_lock(793)")
+            if connection.execute(
+                "SELECT 1 FROM federation_keys WHERE retired_at IS NULL"
+            ).fetchone():
+                raise RuntimeError("An active federation key already exists.")
+            connection.execute(
+                """INSERT INTO federation_keys(
+                    id, public_pem, encrypted_private_pem, created_at, retired_at
+                ) VALUES (%s, %s, %s, %s, %s)""",
+                (
+                    key.id,
+                    key.public_pem,
+                    key.encrypted_private_pem,
+                    key.created_at,
+                    key.retired_at,
+                ),
+            )
+
+    def federation_key(self, key_id: str) -> FederationKey | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM federation_keys WHERE id = %s", (key_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return FederationKey(
+            id=str(row[0]),
+            public_pem=str(row[1]),
+            encrypted_private_pem=bytes(row[2]),
+            created_at=_datetime(row[3]),
+            retired_at=_datetime(row[4]) if row[4] else None,
+        )
+
+    def rotate_federation_key(self, key: FederationKey, *, retired_at: datetime) -> None:
+        with self._pool.connection() as connection, connection.transaction():
+            connection.execute("SELECT pg_advisory_xact_lock(793)")
+            retired = connection.execute(
+                """UPDATE federation_keys SET retired_at = %s
+                WHERE retired_at IS NULL RETURNING id""",
+                (retired_at,),
+            ).fetchone()
+            if retired is None:
+                raise RuntimeError("Federation key rotation requires one active key.")
+            connection.execute(
+                """INSERT INTO federation_keys(
+                    id, public_pem, encrypted_private_pem, created_at, retired_at
+                ) VALUES (%s, %s, %s, %s, NULL)""",
+                (key.id, key.public_pem, key.encrypted_private_pem, key.created_at),
+            )
+
+    def record_inbox_receipt(self, receipt: InboxReceipt) -> bool:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """INSERT INTO inbox_receipts(
+                    signature_hash, activity_id, activity_type, status, diagnostic, received_at
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING RETURNING signature_hash""",
+                (
+                    receipt.signature_hash,
+                    receipt.activity_id,
+                    receipt.activity_type,
+                    receipt.status,
+                    receipt.diagnostic,
+                    receipt.received_at,
+                ),
+            ).fetchone()
+        return row is not None
+
+    def inbox_receipts(self) -> tuple[InboxReceipt, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM inbox_receipts ORDER BY received_at"
+            ).fetchall()
+        return tuple(_inbox_receipt_from_sequence(row) for row in rows)
+
 
 def store_from_url(database_url: str) -> Store:
     if database_url.startswith("sqlite:///"):
@@ -662,3 +924,14 @@ def _module_values(modules: Sequence[ProfileModule], now: datetime) -> list[tupl
         (module.kind, module.enabled, module.position, json.dumps(module.config), now)
         for module in modules
     ]
+
+
+def _inbox_receipt_from_sequence(row: Sequence[object]) -> InboxReceipt:
+    return InboxReceipt(
+        signature_hash=str(row[0]),
+        activity_id=str(row[1]),
+        activity_type=str(row[2]),
+        status=str(row[3]),
+        diagnostic=str(row[4]),
+        received_at=_datetime(row[5]),
+    )

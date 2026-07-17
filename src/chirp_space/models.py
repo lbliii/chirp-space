@@ -85,3 +85,22 @@ class Customization:
     theme: Theme
     modules: tuple[ProfileModule, ...]
     expected_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class FederationKey:
+    id: str
+    public_pem: str
+    encrypted_private_pem: bytes
+    created_at: datetime
+    retired_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InboxReceipt:
+    signature_hash: str
+    activity_id: str
+    activity_type: str
+    status: str
+    diagnostic: str
+    received_at: datetime

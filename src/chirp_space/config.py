@@ -47,7 +47,9 @@ class SpaceConfig:
     database_url: str
     secret_key: str
     claim_token: str
+    key_encryption_key: str
     canonical_origin: str
+    federation_enabled: bool = False
     host_aliases: tuple[str, ...] = ()
 
     @property
@@ -63,7 +65,11 @@ class SpaceConfig:
         database_url = (os.environ.get("DATABASE_URL") or "").strip()
         secret_key = (os.environ.get("CHIRP_SECRET_KEY") or "").strip()
         claim_token = (os.environ.get("SPACE_OWNER_CLAIM_TOKEN") or "").strip()
+        key_encryption_key = (os.environ.get("SPACE_KEY_ENCRYPTION_KEY") or "").strip()
         canonical_origin = (os.environ.get("SPACE_CANONICAL_ORIGIN") or "").strip()
+        federation_enabled = (
+            os.environ.get("SPACE_FEDERATION_ENABLED") or ""
+        ).strip().lower() == "true"
         railway_domain = (os.environ.get("RAILWAY_PUBLIC_DOMAIN") or "").strip()
         if not canonical_origin and railway_domain:
             canonical_origin = f"https://{railway_domain}"
@@ -75,12 +81,17 @@ class SpaceConfig:
                 raise RuntimeError("CHIRP_SECRET_KEY must be at least 32 characters.")
             if len(claim_token) < 24:
                 raise RuntimeError("SPACE_OWNER_CLAIM_TOKEN must be at least 24 characters.")
+            if len(key_encryption_key) < 32:
+                raise RuntimeError("SPACE_KEY_ENCRYPTION_KEY must be at least 32 characters.")
             if not canonical_origin:
                 raise RuntimeError("SPACE_CANONICAL_ORIGIN is required in production.")
         else:
             database_url = database_url or "sqlite:///:memory:"
             secret_key = secret_key or secrets.token_urlsafe(48)
             claim_token = claim_token or "development-owner-claim-token"
+            key_encryption_key = (
+                key_encryption_key or "development-federation-key-encryption-secret"
+            )
             canonical_origin = canonical_origin or "http://localhost:8000"
 
         aliases = tuple(
@@ -94,6 +105,8 @@ class SpaceConfig:
             database_url=database_url,
             secret_key=secret_key,
             claim_token=claim_token,
+            key_encryption_key=key_encryption_key,
             canonical_origin=normalize_origin(canonical_origin, production=production),
+            federation_enabled=federation_enabled,
             host_aliases=aliases,
         )
