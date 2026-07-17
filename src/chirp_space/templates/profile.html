@@ -1,0 +1,37 @@
+{% extends "layout.html" %}
+{% block title %}{{ profile.owner.display_name }} · Chirp Space{% end %}
+{% block page_content %}
+{% if preview %}<div class="preview-banner" role="status">Private preview · nothing here has been published</div>{% end %}
+<article class="profile" aria-labelledby="profile-title">
+  {% for module in profile.modules %}
+    {% if module.enabled %}
+      {% if module.kind == "identity" %}
+      <header class="profile-identity">
+        <p class="eyebrow">@{{ profile.owner.handle }}</p>
+        <h1 id="profile-title">{{ profile.owner.display_name }}</h1>
+        {% if module.config.tagline %}<p class="tagline">{{ module.config.tagline }}</p>{% end %}
+        {% if profile.owner.bio %}<p class="bio">{{ profile.owner.bio }}</p>{% end %}
+        <p class="profile-meta">
+          {% if profile.owner.location %}<span>{{ profile.owner.location }}</span>{% end %}
+          {% if profile.owner.website_url %}<a href="{{ profile.owner.website_url }}" rel="me noopener noreferrer">Website <span aria-hidden="true">↗</span></a>{% end %}
+        </p>
+      </header>
+      {% elif module.kind == "links" and module.config.items %}
+      <section aria-labelledby="links-title"><h2 id="links-title">Elsewhere</h2><ul class="link-list">{% for link in module.config.items %}<li><a href="{{ link.url }}" rel="me noopener noreferrer">{{ link.label }} <span aria-hidden="true">↗</span></a></li>{% end %}</ul></section>
+      {% elif module.kind == "featured" %}
+      <section><h2>Featured</h2><p class="empty-state">A featured story will appear here after publishing ships.</p></section>
+      {% elif module.kind == "recent_posts" %}
+      <section><h2>Recent posts</h2><p class="empty-state">No public posts yet.</p></section>
+      {% elif module.kind == "journal" %}
+      <section><h2>Journal</h2><p class="empty-state">No journal entries yet.</p></section>
+      {% elif module.kind == "photos" %}
+      <section><h2>Photos</h2><p class="empty-state">No public photos yet.</p></section>
+      {% elif module.kind == "tags" %}
+      <section><h2>Topics</h2><p class="empty-state">Topics appear after publishing.</p></section>
+      {% elif module.kind == "guestbook" %}
+      <section><h2>Guestbook</h2><p>{{ module.config.prompt }}</p><p class="empty-state">Guestbook submissions arrive with the publishing slice.</p></section>
+      {% end %}
+    {% end %}
+  {% end %}
+</article>
+{% end %}

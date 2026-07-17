@@ -1,0 +1,15 @@
+{% extends "layout.html" %}
+{% block title %}Owner sign in{% end %}
+{% block page_content %}
+<div class="narrow">
+  <header class="page-heading"><p class="eyebrow">Owner access</p><h1>Sign in</h1></header>
+  {% if error %}<div class="notice error" role="alert">{{ error }}</div>{% end %}
+  <form method="post" class="form-card" hx-boost="false">
+    {{ csrf_field() }}
+    <label>Handle<input name="handle" value="{{ handle }}" autocomplete="username" required></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+    <button class="button primary" type="submit">Sign in</button>
+  </form>
+  <p><a href="/recover">Use a one-time recovery code</a></p>
+</div>
+{% end %}
