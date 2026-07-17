@@ -9,6 +9,7 @@
   <meta name="theme-color" content="#f4f0e7">
   <title>{% block title %}{% if state %}{{ state.owner.display_name }} · Chirp Space{% else %}Chirp Space setup pending{% end %}{% end %}</title>
   <link rel="canonical" href="{{ canonical_origin }}{{ current_path }}">
+  {% if state %}<link rel="alternate" type="application/rss+xml" title="{{ state.owner.display_name }} feed" href="/feed.xml">{% endif %}
   <link rel="stylesheet" href="/space-static/space.css?v=1">
 </head>
 <body class="{% if state %}{{ state.settings.theme.class_names }}{% else %}theme-system font-system scale-standard density-comfortable radius-soft width-standard{% end %}" hx-boost="true" hx-target="#page-root" hx-swap="outerHTML show:top">
@@ -18,7 +19,9 @@
       <a class="brand" href="/">{% if state %}{{ state.owner.display_name }}{% else %}Chirp Space{% end %}</a>
       <nav aria-label="Primary navigation">
         <a href="/">Home</a>
+        {% if state %}<a href="/archive">Archive</a><a href="/guestbook">Guestbook</a>{% endif %}
         {% if viewer %}
+          <a href="/owner/content">Publish</a>
           <a href="/owner/connections">Connections</a>
           <a href="/owner/customize">Customize</a>
           <a href="/owner">Owner</a>

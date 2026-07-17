@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add the issue #791 local publishing and guestbook surface: short posts, journals, normalized
+  photos, links, drafts and lifecycle controls, stable archives and feeds, moderated anonymous
+  entries, responsive Pillow media, storage-integrity checks, and shared plain-request/htmx flows.
 - Add the issue #796 asymmetric relationship state machines, safe actor/WebFinger discovery,
   Follow/Accept/Reject/Undo flows, derived friends, local circles/pins/mutes/notes, actor and domain
   blocks, exact audience previews, and shared plain-request/htmx owner controls.

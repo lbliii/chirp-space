@@ -1,0 +1,25 @@
+{% extends "layout.html" %}
+{% block title %}{% if item %}Edit content{% else %}New content{% endif %} · {{ state.owner.display_name }}{% end %}
+{% block page_content %}
+<header class="page-heading"><p class="eyebrow">Owner publishing</p><h1>{% if item %}Edit {{ item.kind }}{% else %}Create content{% endif %}</h1><p>Preview and every save work with an ordinary form; JavaScript is optional.</p></header>
+{% if error %}<div class="form-error" role="alert">{{ error }}</div>{% endif %}
+{% if preview %}<section class="preview-panel" aria-labelledby="preview-title"><p class="eyebrow">Private preview</p><h2 id="preview-title">{% if preview.item.title %}{{ preview.item.title }}{% else %}{{ preview.item.source[:80] }}{% endif %}</h2><p>{{ preview.item.source }}</p>{% if preview.item.media %}<p>Normalized {{ preview.item.media.media_type }} · {{ preview.item.media.width }} × {{ preview.item.media.height }}</p>{% endif %}</section>{% endif %}
+<form class="stacked-form" method="post" enctype="multipart/form-data" action="{% if item %}/owner/content/{{ item.id }}/edit{% else %}/owner/content/new{% endif %}" hx-target="#main-content" hx-swap="innerHTML show:top" hx-disinherit="hx-target hx-select">
+  {{ csrf_field() }}
+  <input type="hidden" name="revision" value="{{ values.revision }}">
+  <label for="kind">Content type</label>
+  <select id="kind" name="kind" {% if item %}disabled{% endif %}>
+    {% for kind in ["short", "journal", "photo", "link"] %}<option value="{{ kind }}" {% if values.kind == kind %}selected{% endif %}>{{ kind|title }}</option>{% end %}
+  </select>
+  <label for="state">Visibility</label>
+  <select id="state" name="state"><option value="draft" {% if values.state == "draft" %}selected{% endif %}>Draft</option><option value="local_only" {% if values.state == "local_only" %}selected{% endif %}>Local only</option><option value="public" {% if values.state == "public" %}selected{% endif %}>Public</option></select>
+  <label for="title">Title <span class="hint">required for journal and link entries</span></label><input id="title" name="title" maxlength="200" value="{{ values.title }}">
+  <label for="source">Content or caption</label><textarea id="source" name="source" rows="12" maxlength="100000">{{ values.source }}</textarea>
+  <label for="external-url">Link URL <span class="hint">HTTPS only</span></label><input id="external-url" name="external_url" type="url" value="{{ values.external_url }}">
+  {% if not item or item.kind == "photo" %}<label for="image">Photo <span class="hint">JPEG, PNG, or WebP; 10 MiB and 4096 px maximum{% if item and item.media %}; leave blank to keep the current image{% endif %}</span></label><input id="image" name="image" type="file" accept="image/jpeg,image/png,image/webp">{% endif %}
+  <label for="alt-text">Photo alt text</label><textarea id="alt-text" name="alt_text" rows="3" maxlength="500">{{ values.alt_text }}</textarea>
+  <label for="tags">Topics <span class="hint">comma-separated, up to eight</span></label><input id="tags" name="tags" value="{{ values.tags }}">
+  <div class="button-row">{% if not item %}<button type="submit" name="intent" value="preview">Preview</button>{% endif %}<button class="button" type="submit" name="intent" value="save">Save</button><a href="/owner/content">Cancel</a></div>
+</form>
+{% if item %}<section class="critical-card" aria-labelledby="delete-title"><h2 id="delete-title">Delete this entry</h2><p>Public content becomes a stable tombstone. Attached media cleanup is retryable.</p><form method="post" action="/owner/content/{{ item.id }}/delete" hx-target="#main-content" hx-swap="innerHTML show:top" hx-disinherit="hx-target hx-select">{{ csrf_field() }}<input type="hidden" name="revision" value="{{ item.revision }}"><label for="confirm-delete">Type delete to confirm</label><input id="confirm-delete" name="confirm" autocomplete="off"><button class="danger-button" type="submit">Delete entry</button></form></section>{% endif %}
+{% end %}

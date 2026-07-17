@@ -10,14 +10,18 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
-from typing import Protocol
+from typing import Any, Protocol
 
 from chirp_space.models import (
     Circle,
+    ContentItem,
     Delivery,
     DeliveryJob,
     FederationKey,
+    GuestbookEntry,
     InboxReceipt,
+    MediaAsset,
+    MediaVariant,
     OutboundActivity,
     Owner,
     ProfileModule,
@@ -169,6 +173,68 @@ CREATE TABLE IF NOT EXISTS domain_blocks (
     domain TEXT PRIMARY KEY,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS media_assets (
+    id TEXT PRIMARY KEY,
+    object_key TEXT NOT NULL UNIQUE,
+    media_type TEXT NOT NULL CHECK (media_type IN ('image/jpeg', 'image/png', 'image/webp')),
+    width INTEGER NOT NULL CHECK (width BETWEEN 1 AND 4096),
+    height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 4096),
+    byte_size INTEGER NOT NULL CHECK (byte_size BETWEEN 1 AND 10485760),
+    checksum TEXT NOT NULL,
+    alt_text TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ready', 'missing', 'cleanup-pending', 'deleted')),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS media_variants (
+    asset_id TEXT NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+    name TEXT NOT NULL CHECK (name IN ('small', 'medium')),
+    object_key TEXT NOT NULL UNIQUE,
+    media_type TEXT NOT NULL CHECK (media_type IN ('image/jpeg', 'image/png', 'image/webp')),
+    width INTEGER NOT NULL CHECK (width BETWEEN 1 AND 4096),
+    height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 4096),
+    byte_size INTEGER NOT NULL CHECK (byte_size BETWEEN 1 AND 10485760),
+    checksum TEXT NOT NULL,
+    PRIMARY KEY(asset_id, name)
+);
+CREATE TABLE IF NOT EXISTS content_items (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('short', 'journal', 'photo', 'link')),
+    state TEXT NOT NULL CHECK (state IN ('draft', 'local_only', 'public', 'deleted')),
+    title TEXT NOT NULL,
+    source TEXT NOT NULL,
+    external_url TEXT,
+    media_id TEXT REFERENCES media_assets(id),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    published_at TEXT,
+    deleted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_content_public
+    ON content_items(state, published_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS tags (
+    slug TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS content_tags (
+    content_id TEXT NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    tag_slug TEXT NOT NULL REFERENCES tags(slug) ON DELETE CASCADE,
+    PRIMARY KEY(content_id, tag_slug)
+);
+CREATE TABLE IF NOT EXISTS guestbook_entries (
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    message TEXT NOT NULL,
+    website_url TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'deleted')),
+    abuse_token TEXT NOT NULL,
+    submission_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    moderated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_guestbook_abuse
+    ON guestbook_entries(abuse_token, created_at);
 """
 
 POSTGRES_MIGRATION = (
@@ -313,6 +379,68 @@ POSTGRES_MIGRATION = (
         domain TEXT PRIMARY KEY,
         created_at TIMESTAMPTZ NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS media_assets (
+        id UUID PRIMARY KEY,
+        object_key TEXT NOT NULL UNIQUE,
+        media_type TEXT NOT NULL CHECK (media_type IN ('image/jpeg', 'image/png', 'image/webp')),
+        width INTEGER NOT NULL CHECK (width BETWEEN 1 AND 4096),
+        height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 4096),
+        byte_size INTEGER NOT NULL CHECK (byte_size BETWEEN 1 AND 10485760),
+        checksum TEXT NOT NULL,
+        alt_text TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('ready', 'missing', 'cleanup-pending', 'deleted')),
+        created_at TIMESTAMPTZ NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS media_variants (
+        asset_id UUID NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (name IN ('small', 'medium')),
+        object_key TEXT NOT NULL UNIQUE,
+        media_type TEXT NOT NULL CHECK (media_type IN ('image/jpeg', 'image/png', 'image/webp')),
+        width INTEGER NOT NULL CHECK (width BETWEEN 1 AND 4096),
+        height INTEGER NOT NULL CHECK (height BETWEEN 1 AND 4096),
+        byte_size INTEGER NOT NULL CHECK (byte_size BETWEEN 1 AND 10485760),
+        checksum TEXT NOT NULL,
+        PRIMARY KEY(asset_id, name)
+    )""",
+    """CREATE TABLE IF NOT EXISTS content_items (
+        id UUID PRIMARY KEY,
+        owner_id UUID NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('short', 'journal', 'photo', 'link')),
+        state TEXT NOT NULL CHECK (state IN ('draft', 'local_only', 'public', 'deleted')),
+        title TEXT NOT NULL,
+        source TEXT NOT NULL,
+        external_url TEXT,
+        media_id UUID REFERENCES media_assets(id),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        created_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL,
+        published_at TIMESTAMPTZ,
+        deleted_at TIMESTAMPTZ
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_content_public
+        ON content_items(state, published_at DESC, id DESC)""",
+    """CREATE TABLE IF NOT EXISTS tags (
+        slug TEXT PRIMARY KEY,
+        name TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS content_tags (
+        content_id UUID NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+        tag_slug TEXT NOT NULL REFERENCES tags(slug) ON DELETE CASCADE,
+        PRIMARY KEY(content_id, tag_slug)
+    )""",
+    """CREATE TABLE IF NOT EXISTS guestbook_entries (
+        id UUID PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        message TEXT NOT NULL,
+        website_url TEXT,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'deleted')),
+        abuse_token TEXT NOT NULL,
+        submission_hash TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL,
+        moderated_at TIMESTAMPTZ
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_guestbook_abuse
+        ON guestbook_entries(abuse_token, created_at)""",
 )
 
 RELATIONSHIP_SELECT = """SELECT
@@ -386,6 +514,34 @@ class Store(Protocol):
     def unblock_domain(self, domain: str) -> None: ...
     def blocked_domains(self) -> tuple[str, ...]: ...
     def is_blocked(self, actor_id: str | None = None, domain: str | None = None) -> bool: ...
+    def save_media(self, asset: MediaAsset) -> None: ...
+    def media(self, asset_id: str) -> MediaAsset | None: ...
+    def media_by_status(self, status: str, *, limit: int = 100) -> tuple[MediaAsset, ...]: ...
+    def update_media_status(self, asset_id: str, status: str) -> None: ...
+    def create_content(self, item: ContentItem) -> ContentItem: ...
+    def update_content(self, item: ContentItem, *, expected_revision: int) -> ContentItem: ...
+    def content_item(self, item_id: str) -> ContentItem | None: ...
+    def content_items(
+        self,
+        *,
+        public_only: bool,
+        limit: int = 50,
+        before: tuple[datetime, str] | None = None,
+        kind: str | None = None,
+        tag: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+        query: str | None = None,
+    ) -> tuple[ContentItem, ...]: ...
+    def content_archive(self) -> tuple[tuple[int, int, int], ...]: ...
+    def tag_counts(self) -> tuple[tuple[str, int], ...]: ...
+    def create_guestbook_entry(
+        self, entry: GuestbookEntry, *, since: datetime, limit: int
+    ) -> str: ...
+    def guestbook_entries(self, *, public_only: bool) -> tuple[GuestbookEntry, ...]: ...
+    def moderate_guestbook(
+        self, entry_id: str, *, status: str, moderated_at: datetime
+    ) -> GuestbookEntry: ...
 
 
 class SQLiteStore:
@@ -428,6 +584,10 @@ class SQLiteStore:
             self._connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (4, ?, ?)",
                 ("asymmetric relationships and local circles", _iso(datetime.now(UTC))),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (5, ?, ?)",
+                ("personal publishing media tags and guestbook", _iso(datetime.now(UTC))),
             )
 
     def close(self) -> None:
@@ -1231,6 +1391,312 @@ class SQLiteStore:
                 ).fetchone()
             )
 
+    def save_media(self, asset: MediaAsset) -> None:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                self._connection.execute(
+                    """INSERT INTO media_assets(
+                        id, object_key, media_type, width, height, byte_size,
+                        checksum, alt_text, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        asset.id,
+                        asset.object_key,
+                        asset.media_type,
+                        asset.width,
+                        asset.height,
+                        asset.byte_size,
+                        asset.checksum,
+                        asset.alt_text,
+                        asset.status,
+                        _iso(asset.created_at),
+                    ),
+                )
+                for variant in asset.variants:
+                    self._connection.execute(
+                        """INSERT INTO media_variants(
+                            asset_id, name, object_key, media_type, width, height,
+                            byte_size, checksum
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            asset.id,
+                            variant.name,
+                            variant.object_key,
+                            variant.media_type,
+                            variant.width,
+                            variant.height,
+                            variant.byte_size,
+                            variant.checksum,
+                        ),
+                    )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    def media(self, asset_id: str) -> MediaAsset | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM media_assets WHERE id = ?", (asset_id,)
+            ).fetchone()
+            variants = self._connection.execute(
+                "SELECT * FROM media_variants WHERE asset_id = ? ORDER BY width",
+                (asset_id,),
+            ).fetchall()
+        return (
+            _media_from_mapping(
+                row, tuple(_media_variant_from_mapping(variant) for variant in variants)
+            )
+            if row is not None
+            else None
+        )
+
+    def media_by_status(self, status: str, *, limit: int = 100) -> tuple[MediaAsset, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id FROM media_assets WHERE status = ? ORDER BY created_at LIMIT ?",
+                (status, max(1, min(limit, 1_000))),
+            ).fetchall()
+        assets = tuple(self.media(str(row[0])) for row in rows)
+        return tuple(asset for asset in assets if asset is not None)
+
+    def update_media_status(self, asset_id: str, status: str) -> None:
+        with self._lock:
+            updated = self._connection.execute(
+                "UPDATE media_assets SET status = ? WHERE id = ?", (status, asset_id)
+            )
+        if updated.rowcount != 1:
+            raise RuntimeError("Media asset does not exist.")
+
+    def create_content(self, item: ContentItem) -> ContentItem:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                self._connection.execute(
+                    """INSERT INTO content_items(
+                        id, owner_id, kind, state, title, source, external_url, media_id,
+                        revision, created_at, updated_at, published_at, deleted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    _content_values(item, sqlite=True),
+                )
+                self._replace_content_tags(item.id, item.tags)
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return item
+
+    def update_content(self, item: ContentItem, *, expected_revision: int) -> ContentItem:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                updated = self._connection.execute(
+                    """UPDATE content_items SET state = ?, title = ?, source = ?,
+                    external_url = ?, media_id = ?, revision = ?, updated_at = ?,
+                    published_at = ?, deleted_at = ? WHERE id = ? AND revision = ?""",
+                    (
+                        item.state,
+                        item.title,
+                        item.source,
+                        item.external_url,
+                        item.media.id if item.media else None,
+                        item.revision,
+                        _iso(item.updated_at),
+                        _iso(item.published_at) if item.published_at else None,
+                        _iso(item.deleted_at) if item.deleted_at else None,
+                        item.id,
+                        expected_revision,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("Content changed in another session. Reload and try again.")
+                if item.media is not None:
+                    self._connection.execute(
+                        "UPDATE media_assets SET alt_text = ? WHERE id = ?",
+                        (item.media.alt_text, item.media.id),
+                    )
+                self._replace_content_tags(item.id, item.tags)
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        result = self.content_item(item.id)
+        if result is None:
+            raise RuntimeError("Content disappeared after update.")
+        return result
+
+    def _replace_content_tags(self, item_id: str, tags: Sequence[str]) -> None:
+        self._connection.execute("DELETE FROM content_tags WHERE content_id = ?", (item_id,))
+        for tag in tags:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO tags(slug, name) VALUES (?, ?)", (tag, tag)
+            )
+            self._connection.execute(
+                "INSERT INTO content_tags(content_id, tag_slug) VALUES (?, ?)",
+                (item_id, tag),
+            )
+
+    def content_item(self, item_id: str) -> ContentItem | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM content_items WHERE id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return self._content_from_row(row)
+
+    def content_items(
+        self,
+        *,
+        public_only: bool,
+        limit: int = 50,
+        before: tuple[datetime, str] | None = None,
+        kind: str | None = None,
+        tag: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+        query: str | None = None,
+    ) -> tuple[ContentItem, ...]:
+        before_at, before_id = before or (None, None)
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT c.* FROM content_items c
+                WHERE (? = 0 OR c.state = 'public')
+                  AND (? IS NULL OR c.kind = ?)
+                  AND (? IS NULL OR EXISTS(
+                    SELECT 1 FROM content_tags ct
+                    WHERE ct.content_id = c.id AND ct.tag_slug = ?
+                  ))
+                  AND (? IS NULL OR CAST(strftime('%Y',
+                    COALESCE(c.published_at, c.updated_at)) AS INTEGER) = ?)
+                  AND (? IS NULL OR CAST(strftime('%m',
+                    COALESCE(c.published_at, c.updated_at)) AS INTEGER) = ?)
+                  AND (? IS NULL OR lower(c.title || ' ' || c.source)
+                    LIKE '%' || lower(?) || '%')
+                  AND (? IS NULL OR COALESCE(c.published_at, c.updated_at) < ?
+                    OR (COALESCE(c.published_at, c.updated_at) = ? AND c.id < ?))
+                ORDER BY COALESCE(c.published_at, c.updated_at) DESC, c.id DESC
+                LIMIT ?""",
+                (
+                    public_only,
+                    kind,
+                    kind,
+                    tag,
+                    tag,
+                    year,
+                    year,
+                    month,
+                    month,
+                    query,
+                    query,
+                    _iso(before_at) if before_at else None,
+                    _iso(before_at) if before_at else None,
+                    _iso(before_at) if before_at else None,
+                    before_id,
+                    max(1, min(limit, 100)),
+                ),
+            ).fetchall()
+            return tuple(self._content_from_row(row) for row in rows)
+
+    def content_archive(self) -> tuple[tuple[int, int, int], ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT CAST(strftime('%Y', published_at) AS INTEGER),
+                CAST(strftime('%m', published_at) AS INTEGER), COUNT(*)
+                FROM content_items WHERE state = 'public' AND published_at IS NOT NULL
+                GROUP BY 1, 2 ORDER BY 1 DESC, 2 DESC"""
+            ).fetchall()
+        return tuple((int(row[0]), int(row[1]), int(row[2])) for row in rows)
+
+    def tag_counts(self) -> tuple[tuple[str, int], ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT ct.tag_slug, COUNT(*) FROM content_tags ct
+                JOIN content_items c ON c.id = ct.content_id
+                WHERE c.state = 'public' GROUP BY ct.tag_slug
+                ORDER BY COUNT(*) DESC, ct.tag_slug"""
+            ).fetchall()
+        return tuple((str(row[0]), int(row[1])) for row in rows)
+
+    def _content_from_row(self, row: sqlite3.Row) -> ContentItem:
+        tags = tuple(
+            str(item[0])
+            for item in self._connection.execute(
+                "SELECT tag_slug FROM content_tags WHERE content_id = ? ORDER BY tag_slug",
+                (str(row["id"]),),
+            )
+        )
+        media = self.media(str(row["media_id"])) if row["media_id"] else None
+        return _content_from_mapping(row, tags, media)
+
+    def create_guestbook_entry(self, entry: GuestbookEntry, *, since: datetime, limit: int) -> str:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                count_row = self._connection.execute(
+                    """SELECT COUNT(*) FROM guestbook_entries
+                    WHERE abuse_token = ? AND created_at >= ?""",
+                    (entry.abuse_token, _iso(since)),
+                ).fetchone()
+                if count_row is None:
+                    raise RuntimeError("Guestbook rate-limit query returned no result.")
+                count = int(count_row[0])
+                duplicate = self._connection.execute(
+                    "SELECT 1 FROM guestbook_entries WHERE submission_hash = ?",
+                    (entry.submission_hash,),
+                ).fetchone()
+                if duplicate is not None:
+                    self._connection.execute("COMMIT")
+                    return "duplicate"
+                if count >= limit:
+                    self._connection.execute("COMMIT")
+                    return "limited"
+                self._connection.execute(
+                    """INSERT INTO guestbook_entries(
+                        id, display_name, message, website_url, status,
+                        abuse_token, submission_hash, created_at, moderated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        entry.id,
+                        entry.display_name,
+                        entry.message,
+                        entry.website_url,
+                        entry.status,
+                        entry.abuse_token,
+                        entry.submission_hash,
+                        _iso(entry.created_at),
+                        _iso(entry.moderated_at) if entry.moderated_at else None,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return "created"
+
+    def guestbook_entries(self, *, public_only: bool) -> tuple[GuestbookEntry, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM guestbook_entries
+                WHERE (? = 0 OR status = 'approved') ORDER BY created_at DESC, id DESC""",
+                (public_only,),
+            ).fetchall()
+        return tuple(_guestbook_from_mapping(row) for row in rows)
+
+    def moderate_guestbook(
+        self, entry_id: str, *, status: str, moderated_at: datetime
+    ) -> GuestbookEntry:
+        with self._lock:
+            row = self._connection.execute(
+                """UPDATE guestbook_entries SET status = ?, moderated_at = ?
+                WHERE id = ? AND status != 'deleted' RETURNING *""",
+                (status, _iso(moderated_at), entry_id),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Guestbook entry does not exist or is deleted.")
+        return _guestbook_from_mapping(row)
+
 
 class PostgresStore:
     """Production PostgreSQL adapter with transactional single-owner setup."""
@@ -1273,6 +1739,11 @@ class PostgresStore:
                 """INSERT INTO schema_migrations(version, name) VALUES (4, %s)
                 ON CONFLICT (version) DO NOTHING""",
                 ("asymmetric relationships and local circles",),
+            )
+            connection.execute(
+                """INSERT INTO schema_migrations(version, name) VALUES (5, %s)
+                ON CONFLICT (version) DO NOTHING""",
+                ("personal publishing media tags and guestbook",),
             )
 
     def close(self) -> None:
@@ -1964,6 +2435,307 @@ class PostgresStore:
                 ).fetchone()
             )
 
+    def save_media(self, asset: MediaAsset) -> None:
+        with self._pool.connection() as connection, connection.transaction():
+            connection.execute(
+                """INSERT INTO media_assets(
+                    id, object_key, media_type, width, height, byte_size,
+                    checksum, alt_text, status, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    asset.id,
+                    asset.object_key,
+                    asset.media_type,
+                    asset.width,
+                    asset.height,
+                    asset.byte_size,
+                    asset.checksum,
+                    asset.alt_text,
+                    asset.status,
+                    asset.created_at,
+                ),
+            )
+            for variant in asset.variants:
+                connection.execute(
+                    """INSERT INTO media_variants(
+                        asset_id, name, object_key, media_type, width, height,
+                        byte_size, checksum
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        asset.id,
+                        variant.name,
+                        variant.object_key,
+                        variant.media_type,
+                        variant.width,
+                        variant.height,
+                        variant.byte_size,
+                        variant.checksum,
+                    ),
+                )
+
+    def media(self, asset_id: str) -> MediaAsset | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """SELECT id, object_key, media_type, width, height, byte_size,
+                checksum, alt_text, status, created_at FROM media_assets WHERE id = %s""",
+                (asset_id,),
+            ).fetchone()
+            variants = connection.execute(
+                """SELECT name, object_key, media_type, width, height, byte_size,
+                checksum FROM media_variants WHERE asset_id = %s ORDER BY width""",
+                (asset_id,),
+            ).fetchall()
+        return (
+            _media_from_sequence(
+                row, tuple(_media_variant_from_sequence(variant) for variant in variants)
+            )
+            if row is not None
+            else None
+        )
+
+    def media_by_status(self, status: str, *, limit: int = 100) -> tuple[MediaAsset, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT id FROM media_assets
+                WHERE status = %s ORDER BY created_at LIMIT %s""",
+                (status, max(1, min(limit, 1_000))),
+            ).fetchall()
+        assets = tuple(self.media(str(row[0])) for row in rows)
+        return tuple(asset for asset in assets if asset is not None)
+
+    def update_media_status(self, asset_id: str, status: str) -> None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "UPDATE media_assets SET status = %s WHERE id = %s RETURNING id",
+                (status, asset_id),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Media asset does not exist.")
+
+    def create_content(self, item: ContentItem) -> ContentItem:
+        with self._pool.connection() as connection, connection.transaction():
+            connection.execute(
+                """INSERT INTO content_items(
+                    id, owner_id, kind, state, title, source, external_url, media_id,
+                    revision, created_at, updated_at, published_at, deleted_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                _content_values(item, sqlite=False),
+            )
+            self._replace_content_tags(connection, item.id, item.tags)
+        return item
+
+    def update_content(self, item: ContentItem, *, expected_revision: int) -> ContentItem:
+        with self._pool.connection() as connection, connection.transaction():
+            row = connection.execute(
+                """UPDATE content_items SET state = %s, title = %s, source = %s,
+                external_url = %s, media_id = %s, revision = %s, updated_at = %s,
+                published_at = %s, deleted_at = %s WHERE id = %s AND revision = %s
+                RETURNING id""",
+                (
+                    item.state,
+                    item.title,
+                    item.source,
+                    item.external_url,
+                    item.media.id if item.media else None,
+                    item.revision,
+                    item.updated_at,
+                    item.published_at,
+                    item.deleted_at,
+                    item.id,
+                    expected_revision,
+                ),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Content changed in another session. Reload and try again.")
+            if item.media is not None:
+                connection.execute(
+                    "UPDATE media_assets SET alt_text = %s WHERE id = %s",
+                    (item.media.alt_text, item.media.id),
+                )
+            self._replace_content_tags(connection, item.id, item.tags)
+        result = self.content_item(item.id)
+        if result is None:
+            raise RuntimeError("Content disappeared after update.")
+        return result
+
+    def _replace_content_tags(self, connection: Any, item_id: str, tags: Sequence[str]) -> None:
+        connection.execute("DELETE FROM content_tags WHERE content_id = %s", (item_id,))
+        for tag in tags:
+            connection.execute(
+                """INSERT INTO tags(slug, name) VALUES (%s, %s)
+                ON CONFLICT(slug) DO NOTHING""",
+                (tag, tag),
+            )
+            connection.execute(
+                "INSERT INTO content_tags(content_id, tag_slug) VALUES (%s, %s)",
+                (item_id, tag),
+            )
+
+    def content_item(self, item_id: str) -> ContentItem | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """SELECT id, owner_id, kind, state, title, source, external_url,
+                media_id, revision, created_at, updated_at, published_at, deleted_at
+                FROM content_items WHERE id = %s""",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._content_from_sequence(connection, row)
+
+    def content_items(
+        self,
+        *,
+        public_only: bool,
+        limit: int = 50,
+        before: tuple[datetime, str] | None = None,
+        kind: str | None = None,
+        tag: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+        query: str | None = None,
+    ) -> tuple[ContentItem, ...]:
+        before_at, before_id = before or (None, None)
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT c.id, c.owner_id, c.kind, c.state, c.title, c.source,
+                c.external_url, c.media_id, c.revision, c.created_at, c.updated_at,
+                c.published_at, c.deleted_at FROM content_items c
+                WHERE (%s = FALSE OR c.state = 'public')
+                  AND (%s IS NULL OR c.kind = %s)
+                  AND (%s IS NULL OR EXISTS(
+                    SELECT 1 FROM content_tags ct
+                    WHERE ct.content_id = c.id AND ct.tag_slug = %s
+                  ))
+                  AND (%s IS NULL OR EXTRACT(YEAR FROM
+                    COALESCE(c.published_at, c.updated_at)) = %s)
+                  AND (%s IS NULL OR EXTRACT(MONTH FROM
+                    COALESCE(c.published_at, c.updated_at)) = %s)
+                  AND (%s IS NULL OR (c.title || ' ' || c.source)
+                    ILIKE '%%' || %s || '%%')
+                  AND (%s IS NULL OR COALESCE(c.published_at, c.updated_at) < %s
+                    OR (COALESCE(c.published_at, c.updated_at) = %s AND c.id < %s))
+                ORDER BY COALESCE(c.published_at, c.updated_at) DESC, c.id DESC
+                LIMIT %s""",
+                (
+                    public_only,
+                    kind,
+                    kind,
+                    tag,
+                    tag,
+                    year,
+                    year,
+                    month,
+                    month,
+                    query,
+                    query,
+                    before_at,
+                    before_at,
+                    before_at,
+                    before_id,
+                    max(1, min(limit, 100)),
+                ),
+            ).fetchall()
+            return tuple(self._content_from_sequence(connection, row) for row in rows)
+
+    def content_archive(self) -> tuple[tuple[int, int, int], ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT EXTRACT(YEAR FROM published_at)::INTEGER,
+                EXTRACT(MONTH FROM published_at)::INTEGER, COUNT(*)::INTEGER
+                FROM content_items WHERE state = 'public' AND published_at IS NOT NULL
+                GROUP BY 1, 2 ORDER BY 1 DESC, 2 DESC"""
+            ).fetchall()
+        return tuple((int(row[0]), int(row[1]), int(row[2])) for row in rows)
+
+    def tag_counts(self) -> tuple[tuple[str, int], ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT ct.tag_slug, COUNT(*)::INTEGER FROM content_tags ct
+                JOIN content_items c ON c.id = ct.content_id
+                WHERE c.state = 'public' GROUP BY ct.tag_slug
+                ORDER BY COUNT(*) DESC, ct.tag_slug"""
+            ).fetchall()
+        return tuple((str(row[0]), int(row[1])) for row in rows)
+
+    def _content_from_sequence(self, connection: Any, row: Sequence[object]) -> ContentItem:
+        tags = tuple(
+            str(item[0])
+            for item in connection.execute(
+                "SELECT tag_slug FROM content_tags WHERE content_id = %s ORDER BY tag_slug",
+                (str(row[0]),),
+            ).fetchall()
+        )
+        media = self.media(str(row[7])) if row[7] else None
+        return _content_from_sequence(row, tags, media)
+
+    def create_guestbook_entry(self, entry: GuestbookEntry, *, since: datetime, limit: int) -> str:
+        with self._pool.connection() as connection, connection.transaction():
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (entry.abuse_token,),
+            )
+            count_row = connection.execute(
+                """SELECT COUNT(*) FROM guestbook_entries
+                WHERE abuse_token = %s AND created_at >= %s""",
+                (entry.abuse_token, since),
+            ).fetchone()
+            if count_row is None:
+                raise RuntimeError("Guestbook rate-limit query returned no result.")
+            count = int(count_row[0])
+            duplicate = connection.execute(
+                "SELECT 1 FROM guestbook_entries WHERE submission_hash = %s",
+                (entry.submission_hash,),
+            ).fetchone()
+            if duplicate is not None:
+                return "duplicate"
+            if count >= limit:
+                return "limited"
+            connection.execute(
+                """INSERT INTO guestbook_entries(
+                    id, display_name, message, website_url, status,
+                    abuse_token, submission_hash, created_at, moderated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    entry.id,
+                    entry.display_name,
+                    entry.message,
+                    entry.website_url,
+                    entry.status,
+                    entry.abuse_token,
+                    entry.submission_hash,
+                    entry.created_at,
+                    entry.moderated_at,
+                ),
+            )
+        return "created"
+
+    def guestbook_entries(self, *, public_only: bool) -> tuple[GuestbookEntry, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT id, display_name, message, website_url, status,
+                abuse_token, submission_hash, created_at, moderated_at FROM guestbook_entries
+                WHERE (%s = FALSE OR status = 'approved')
+                ORDER BY created_at DESC, id DESC""",
+                (public_only,),
+            ).fetchall()
+        return tuple(_guestbook_from_sequence(row) for row in rows)
+
+    def moderate_guestbook(
+        self, entry_id: str, *, status: str, moderated_at: datetime
+    ) -> GuestbookEntry:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """UPDATE guestbook_entries SET status = %s, moderated_at = %s
+                WHERE id = %s AND status != 'deleted'
+                RETURNING id, display_name, message, website_url, status,
+                    abuse_token, submission_hash, created_at, moderated_at""",
+                (status, moderated_at, entry_id),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Guestbook entry does not exist or is deleted.")
+        return _guestbook_from_sequence(row)
+
 
 def store_from_url(database_url: str) -> Store:
     if database_url.startswith("sqlite:///"):
@@ -2256,4 +3028,155 @@ def _circles_from_rows(rows: Sequence[Sequence[object]]) -> tuple[Circle, ...]:
             created_at=created_at,
         )
         for circle_id, (name, created_at, members) in grouped.items()
+    )
+
+
+def _content_values(item: ContentItem, *, sqlite: bool) -> tuple[object, ...]:
+    def timestamp(value: datetime | None) -> object:
+        if value is None:
+            return None
+        return _iso(value) if sqlite else value
+
+    return (
+        item.id,
+        item.owner_id,
+        item.kind,
+        item.state,
+        item.title,
+        item.source,
+        item.external_url,
+        item.media.id if item.media else None,
+        item.revision,
+        timestamp(item.created_at),
+        timestamp(item.updated_at),
+        timestamp(item.published_at),
+        timestamp(item.deleted_at),
+    )
+
+
+def _media_variant_from_mapping(row: sqlite3.Row) -> MediaVariant:
+    return MediaVariant(
+        name=str(row["name"]),
+        object_key=str(row["object_key"]),
+        media_type=str(row["media_type"]),
+        width=int(row["width"]),
+        height=int(row["height"]),
+        byte_size=int(row["byte_size"]),
+        checksum=str(row["checksum"]),
+    )
+
+
+def _media_variant_from_sequence(row: Sequence[object]) -> MediaVariant:
+    return MediaVariant(
+        name=str(row[0]),
+        object_key=str(row[1]),
+        media_type=str(row[2]),
+        width=int(str(row[3])),
+        height=int(str(row[4])),
+        byte_size=int(str(row[5])),
+        checksum=str(row[6]),
+    )
+
+
+def _media_from_mapping(row: sqlite3.Row, variants: tuple[MediaVariant, ...] = ()) -> MediaAsset:
+    return MediaAsset(
+        id=str(row["id"]),
+        object_key=str(row["object_key"]),
+        media_type=str(row["media_type"]),
+        width=int(row["width"]),
+        height=int(row["height"]),
+        byte_size=int(row["byte_size"]),
+        checksum=str(row["checksum"]),
+        alt_text=str(row["alt_text"]),
+        status=str(row["status"]),
+        created_at=_datetime(row["created_at"]),
+        variants=variants,
+    )
+
+
+def _media_from_sequence(
+    row: Sequence[object], variants: tuple[MediaVariant, ...] = ()
+) -> MediaAsset:
+    return MediaAsset(
+        id=str(row[0]),
+        object_key=str(row[1]),
+        media_type=str(row[2]),
+        width=int(str(row[3])),
+        height=int(str(row[4])),
+        byte_size=int(str(row[5])),
+        checksum=str(row[6]),
+        alt_text=str(row[7]),
+        status=str(row[8]),
+        created_at=_datetime(row[9]),
+        variants=variants,
+    )
+
+
+def _content_from_mapping(
+    row: sqlite3.Row, tags: tuple[str, ...], media: MediaAsset | None
+) -> ContentItem:
+    return ContentItem(
+        id=str(row["id"]),
+        owner_id=str(row["owner_id"]),
+        kind=str(row["kind"]),
+        state=str(row["state"]),
+        title=str(row["title"]),
+        source=str(row["source"]),
+        external_url=str(row["external_url"]) if row["external_url"] else None,
+        media=media,
+        tags=tags,
+        revision=int(row["revision"]),
+        created_at=_datetime(row["created_at"]),
+        updated_at=_datetime(row["updated_at"]),
+        published_at=_datetime(row["published_at"]) if row["published_at"] else None,
+        deleted_at=_datetime(row["deleted_at"]) if row["deleted_at"] else None,
+    )
+
+
+def _content_from_sequence(
+    row: Sequence[object], tags: tuple[str, ...], media: MediaAsset | None
+) -> ContentItem:
+    return ContentItem(
+        id=str(row[0]),
+        owner_id=str(row[1]),
+        kind=str(row[2]),
+        state=str(row[3]),
+        title=str(row[4]),
+        source=str(row[5]),
+        external_url=str(row[6]) if row[6] else None,
+        media=media,
+        tags=tags,
+        revision=int(str(row[8])),
+        created_at=_datetime(row[9]),
+        updated_at=_datetime(row[10]),
+        published_at=_datetime(row[11]) if row[11] else None,
+        deleted_at=_datetime(row[12]) if row[12] else None,
+    )
+
+
+def _guestbook_from_mapping(row: sqlite3.Row) -> GuestbookEntry:
+    return GuestbookEntry(
+        id=str(row["id"]),
+        display_name=str(row["display_name"]),
+        message=str(row["message"]),
+        website_url=str(row["website_url"]) if row["website_url"] else None,
+        status=str(row["status"]),
+        abuse_token=str(row["abuse_token"]),
+        submission_hash=str(row["submission_hash"]),
+        created_at=_datetime(row["created_at"]),
+        moderated_at=_datetime(row["moderated_at"]) if row["moderated_at"] else None,
+    )
+
+
+def _guestbook_from_sequence(row: Sequence[object]) -> GuestbookEntry:
+    return GuestbookEntry(
+        id=str(row[0]),
+        display_name=str(row[1]),
+        message=str(row[2]),
+        website_url=str(row[3]) if row[3] else None,
+        status=str(row[4]),
+        abuse_token=str(row[5]),
+        submission_hash=str(row[6]),
+        created_at=_datetime(row[7]),
+        moderated_at=_datetime(row[8]) if row[8] else None,
     )

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+from email.utils import format_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
+from xml.etree import ElementTree
 
 from chirp.app import App
 from chirp.config import AppConfig
@@ -21,6 +23,16 @@ from chirp.middleware.static import StaticFiles
 from chirp.templating.returns import Page
 
 from chirp_space.config import SpaceConfig
+from chirp_space.content import (
+    GuestbookService,
+    ImageNormalizer,
+    LocalObjectStorage,
+    ObjectStorage,
+    PublishingService,
+    RecoverableMediaError,
+    content_path,
+    present_content,
+)
 from chirp_space.delivery import DeliveryService
 from chirp_space.federation import (
     ACTIVITY_JSON,
@@ -30,7 +42,8 @@ from chirp_space.federation import (
     SafeFetcher,
     parse_json_object,
 )
-from chirp_space.models import Customization, Owner, SiteState
+from chirp_space.media import PillowImageNormalizer
+from chirp_space.models import ContentItem, Customization, Owner, SiteState
 from chirp_space.relationships import RelationshipService
 from chirp_space.services import SpaceService
 from chirp_space.store import Store, store_from_url
@@ -53,11 +66,17 @@ def create_app(
     store: Store | None = None,
     space_config: SpaceConfig | None = None,
     federation_fetcher: DocumentFetcher | None = None,
+    object_storage: ObjectStorage | None = None,
+    image_normalizer: ImageNormalizer | None = None,
 ) -> App:
     config = space_config or SpaceConfig.from_env(debug=debug)
     database = store or store_from_url(config.database_url)
     database.migrate()
     service = SpaceService(database, config)
+    storage = object_storage or LocalObjectStorage(Path.cwd() / ".chirp-space" / "media")
+    normalizer = image_normalizer or PillowImageNormalizer()
+    publishing = PublishingService(database, config, storage, normalizer)
+    guestbook = GuestbookService(database, config)
     protocol_fetcher = federation_fetcher or SafeFetcher()
     federation = FederationService(database, config, fetcher=protocol_fetcher)
     delivery = DeliveryService(database, federation)
@@ -110,6 +129,97 @@ def create_app(
             canonical_origin=config.canonical_origin,
             current_path=request.path,
             **context,
+        )
+
+    def profile_context() -> dict[str, object]:
+        recent, _ = publishing.list_public(limit=6)
+        journals, _ = publishing.list_public(kind="journal", limit=5)
+        photos, _ = publishing.list_public(kind="photo", limit=6)
+        state = database.state()
+        featured: ContentItem | None = None
+        if state is not None:
+            module = next((item for item in state.modules if item.kind == "featured"), None)
+            featured_id = str(module.config.get("content_id", "")) if module else ""
+            if featured_id:
+                featured = publishing.get(featured_id)
+        return {
+            "recent_content": tuple(present_content(item) for item in recent),
+            "journal_content": tuple(present_content(item) for item in journals),
+            "photo_content": tuple(present_content(item) for item in photos),
+            "featured_content": present_content(featured) if featured else None,
+            "tag_counts": publishing.tag_counts(),
+            "guestbook_entries": database.guestbook_entries(public_only=True),
+        }
+
+    def listing_page(
+        request: Request,
+        *,
+        title: str,
+        kind: str | None = None,
+        tag: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> Page | Response:
+        cursor = str(request.query.get("cursor", "")).strip() or None
+        query = str(request.query.get("q", "")).strip() or None
+        try:
+            items, next_cursor = publishing.list_public(
+                cursor=cursor,
+                kind=kind,
+                tag=tag,
+                year=year,
+                month=month,
+                query=query,
+            )
+        except ValueError as exc:
+            return Response(str(exc), status=400)
+        return render(
+            request,
+            "content_list.html",
+            title=title,
+            content=tuple(present_content(item) for item in items),
+            next_cursor=next_cursor,
+            query=query or "",
+            archive=publishing.archive(),
+            tag_counts=publishing.tag_counts(),
+        )
+
+    def content_page(request: Request, item_id: str, *, expected_kind: str) -> Page | Response:
+        item = publishing.get(item_id, owner=viewer(request) is not None)
+        if item is None or item.kind != expected_kind:
+            return Response("Content not found", status=404)
+        return render(
+            request,
+            "content_detail.html",
+            content=present_content(item),
+            message=get_session().pop("space_message", None),
+        )
+
+    def owner_content_page(
+        request: Request,
+        *,
+        error: str | None = None,
+        values: Mapping[str, object] | None = None,
+        item: ContentItem | None = None,
+        preview: ContentItem | None = None,
+    ) -> Page | Redirect:
+        if viewer(request) is None:
+            return Redirect("/login")
+        if values is not None:
+            return render(
+                request,
+                "content_form.html",
+                error=error,
+                values=values,
+                item=item,
+                preview=present_content(preview) if preview else None,
+            )
+        return render(
+            request,
+            "owner_content.html",
+            content=tuple(present_content(entry) for entry in publishing.owner_items()),
+            guestbook_entries=database.guestbook_entries(public_only=False),
+            message=get_session().pop("space_message", None),
         )
 
     @app.route("/health", referenced=True)
@@ -199,7 +309,166 @@ def create_app(
         state = database.state()
         if state is None:
             return render(request, "setup_pending.html")
-        return render(request, "profile.html", profile=state, preview=False)
+        return render(request, "profile.html", profile=state, preview=False, **profile_context())
+
+    @app.route("/archive", template="content_list.html")
+    def archive_page(request: Request):
+        return listing_page(request, title="Archive")
+
+    @app.route("/archive/{year}", template="content_list.html")
+    def archive_year(request: Request, year: int):
+        return listing_page(request, title=f"Archive for {year}", year=year)
+
+    @app.route("/archive/{year}/{month}", template="content_list.html")
+    def archive_month(request: Request, year: int, month: int):
+        return listing_page(
+            request, title=f"Archive for {year}-{month:02d}", year=year, month=month
+        )
+
+    @app.route("/tags/{tag}", template="content_list.html")
+    def tag_page(request: Request, tag: str):
+        return listing_page(request, title=f"Topic: {tag}", tag=tag)
+
+    @app.route("/posts", template="content_list.html")
+    def posts_page(request: Request):
+        return listing_page(request, title="Posts", kind="short")
+
+    @app.route("/journal", template="content_list.html")
+    def journal_page(request: Request):
+        return listing_page(request, title="Journal", kind="journal")
+
+    @app.route("/photos", template="content_list.html")
+    def photos_page(request: Request):
+        return listing_page(request, title="Photos", kind="photo")
+
+    @app.route("/links", template="content_list.html")
+    def links_page(request: Request):
+        return listing_page(request, title="Links", kind="link")
+
+    @app.route("/posts/{item_id}", template="content_detail.html")
+    def post_page(request: Request, item_id: str):
+        return content_page(request, item_id, expected_kind="short")
+
+    @app.route("/journal/{item_id}", template="content_detail.html")
+    def journal_item_page(request: Request, item_id: str):
+        return content_page(request, item_id, expected_kind="journal")
+
+    @app.route("/photos/{item_id}", template="content_detail.html")
+    def photo_page(request: Request, item_id: str):
+        return content_page(request, item_id, expected_kind="photo")
+
+    @app.route("/links/{item_id}", template="content_detail.html")
+    def link_page(request: Request, item_id: str):
+        return content_page(request, item_id, expected_kind="link")
+
+    @app.route("/media/{asset_id}", referenced=True)
+    def media(request: Request, asset_id: str):
+        _ = request
+        asset = database.media(asset_id)
+        if asset is None:
+            return Response("Media not found", status=404)
+        try:
+            data = publishing.media_bytes(asset)
+        except FileNotFoundError:
+            return Response("Media not found", status=404)
+        return Response(
+            data,
+            content_type=asset.media_type,
+            headers=(
+                ("Cache-Control", "public, max-age=31536000, immutable"),
+                ("X-Content-Type-Options", "nosniff"),
+            ),
+        )
+
+    @app.route("/media/{asset_id}/{variant}", referenced=True)
+    def media_variant(request: Request, asset_id: str, variant: str):
+        _ = request
+        asset = database.media(asset_id)
+        selected = (
+            next((item for item in asset.variants if item.name == variant), None)
+            if asset is not None
+            else None
+        )
+        if asset is None or selected is None:
+            return Response("Media not found", status=404)
+        try:
+            data = publishing.media_bytes(asset, variant=variant)
+        except FileNotFoundError:
+            return Response("Media not found", status=404)
+        return Response(
+            data,
+            content_type=selected.media_type,
+            headers=(
+                ("Cache-Control", "public, max-age=31536000, immutable"),
+                ("X-Content-Type-Options", "nosniff"),
+            ),
+        )
+
+    @app.route("/feed.xml", referenced=True)
+    def feed(request: Request):
+        _ = request
+        state = database.state()
+        if state is None:
+            return Response("Feed not found", status=404)
+        items, _ = publishing.list_public(limit=50)
+        root = ElementTree.Element("rss", version="2.0")
+        channel = ElementTree.SubElement(root, "channel")
+        ElementTree.SubElement(channel, "title").text = state.owner.display_name
+        ElementTree.SubElement(channel, "link").text = config.canonical_origin
+        ElementTree.SubElement(channel, "description").text = state.owner.bio or "Recent posts"
+        for item in items:
+            node = ElementTree.SubElement(channel, "item")
+            title = item.title or item.source[:80] or f"{item.kind.title()} entry"
+            ElementTree.SubElement(node, "title").text = title
+            url = f"{config.canonical_origin}{content_path(item)}"
+            ElementTree.SubElement(node, "link").text = url
+            ElementTree.SubElement(node, "guid", isPermaLink="true").text = url
+            ElementTree.SubElement(node, "description").text = item.source
+            if item.published_at is not None:
+                ElementTree.SubElement(node, "pubDate").text = format_datetime(item.published_at)
+        return Response(
+            ElementTree.tostring(root, encoding="utf-8", xml_declaration=True),
+            content_type="application/rss+xml; charset=utf-8",
+        )
+
+    @app.route("/guestbook", template="guestbook.html")
+    def guestbook_page(request: Request):
+        return render(
+            request,
+            "guestbook.html",
+            entries=database.guestbook_entries(public_only=True),
+            error=None,
+            submitted=str(request.query.get("submitted", "")) == "1",
+            values={"display_name": "", "message": "", "website_url": ""},
+        )
+
+    @app.route("/guestbook", methods=["POST"], template="guestbook.html")
+    async def guestbook_submit(request: Request):
+        form = await request.form()
+        values = {
+            "display_name": str(form.get("display_name", "")),
+            "message": str(form.get("message", "")),
+            "website_url": str(form.get("website_url", "")),
+        }
+        client_key = request.client[0] if request.client else "unknown-client"
+        try:
+            guestbook.submit(
+                display_name=values["display_name"],
+                message=values["message"],
+                website_url=values["website_url"] or None,
+                client_key=client_key,
+                honeypot=str(form.get("company", "")),
+            )
+        except (PermissionError, RuntimeError, ValueError) as exc:
+            return render(
+                request,
+                "guestbook.html",
+                entries=database.guestbook_entries(public_only=True),
+                error=str(exc),
+                submitted=False,
+                values=values,
+            )
+        return Redirect("/guestbook?submitted=1")
 
     @app.route("/{profile}", template="profile.html")
     def public_profile(request: Request, profile: str):
@@ -210,7 +479,7 @@ def create_app(
             or profile[1:].casefold() != state.owner.handle
         ):
             return Response("Profile not found", status=404)
-        return render(request, "profile.html", profile=state, preview=False)
+        return render(request, "profile.html", profile=state, preview=False, **profile_context())
 
     @app.route("/setup", template="setup.html")
     def setup_page(request: Request):
@@ -313,6 +582,165 @@ def create_app(
             recovery_codes=recovery_codes,
             message=get_session().pop("space_message", None),
         )
+
+    @app.route("/owner/content", template="owner_content.html")
+    def owner_content(request: Request):
+        return owner_content_page(request)
+
+    @app.route("/owner/content/new", template="content_form.html")
+    def content_new(request: Request):
+        return owner_content_page(
+            request,
+            values={
+                "kind": "short",
+                "state": "draft",
+                "title": "",
+                "source": "",
+                "tags": "",
+                "external_url": "",
+                "alt_text": "",
+                "revision": "0",
+            },
+        )
+
+    @app.route("/owner/content/new", methods=["POST"], template="content_form.html")
+    async def content_create(request: Request):
+        if viewer(request) is None:
+            return Redirect("/login")
+        form = await request.form()
+        values: dict[str, object] = {
+            "kind": str(form.get("kind", "short")),
+            "state": str(form.get("state", "draft")),
+            "title": str(form.get("title", "")),
+            "source": str(form.get("source", "")),
+            "tags": str(form.get("tags", "")),
+            "external_url": str(form.get("external_url", "")),
+            "alt_text": str(form.get("alt_text", "")),
+            "revision": "0",
+        }
+        upload = form.files.get("image")
+        image_bytes = await upload.read() if upload is not None and upload.size else None
+        try:
+            if str(form.get("intent", "save")) == "preview":
+                preview = publishing.preview(
+                    kind=str(values["kind"]),
+                    state=str(values["state"]),
+                    title=str(values["title"]),
+                    source=str(values["source"]),
+                    tags=str(values["tags"]),
+                    external_url=str(values["external_url"]) or None,
+                    image_bytes=image_bytes,
+                    alt_text=str(values["alt_text"]),
+                )
+                return owner_content_page(request, values=values, preview=preview)
+            item = publishing.create(
+                kind=str(values["kind"]),
+                state=str(values["state"]),
+                title=str(values["title"]),
+                source=str(values["source"]),
+                tags=str(values["tags"]),
+                external_url=str(values["external_url"]) or None,
+                image_bytes=image_bytes,
+                alt_text=str(values["alt_text"]),
+            )
+        except RecoverableMediaError as exc:
+            return owner_content_page(request, error=str(exc), values=values, item=exc.draft)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return owner_content_page(request, error=str(exc), values=values)
+        get_session()["space_message"] = (
+            "Content published." if item.state == "public" else "Content saved."
+        )
+        return Redirect(content_path(item) if item.state == "public" else "/owner/content")
+
+    @app.route("/owner/content/{item_id}/edit", template="content_form.html")
+    def content_edit(request: Request, item_id: str):
+        if viewer(request) is None:
+            return Redirect("/login")
+        item = publishing.get(item_id, owner=True)
+        if item is None or item.state == "deleted":
+            return Response("Content not found", status=404)
+        return owner_content_page(
+            request,
+            item=item,
+            values={
+                "kind": item.kind,
+                "state": item.state,
+                "title": item.title,
+                "source": item.source,
+                "tags": ", ".join(item.tags),
+                "external_url": item.external_url or "",
+                "alt_text": item.media.alt_text if item.media else "",
+                "revision": str(item.revision),
+            },
+        )
+
+    @app.route("/owner/content/{item_id}/edit", methods=["POST"], template="content_form.html")
+    async def content_update(request: Request, item_id: str):
+        if viewer(request) is None:
+            return Redirect("/login")
+        form = await request.form()
+        current = publishing.get(item_id, owner=True)
+        if current is None or current.state == "deleted":
+            return Response("Content not found", status=404)
+        values: dict[str, object] = {
+            "kind": current.kind,
+            "state": str(form.get("state", "draft")),
+            "title": str(form.get("title", "")),
+            "source": str(form.get("source", "")),
+            "tags": str(form.get("tags", "")),
+            "external_url": str(form.get("external_url", "")),
+            "alt_text": str(form.get("alt_text", "")),
+            "revision": str(form.get("revision", "0")),
+        }
+        upload = form.files.get("image")
+        image_bytes = await upload.read() if upload is not None and upload.size else None
+        try:
+            item = publishing.update(
+                item_id,
+                expected_revision=int(str(values["revision"])),
+                state=str(values["state"]),
+                title=str(values["title"]),
+                source=str(values["source"]),
+                tags=str(values["tags"]),
+                external_url=str(values["external_url"]) or None,
+                alt_text=str(values["alt_text"]),
+                image_bytes=image_bytes,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return owner_content_page(request, error=str(exc), values=values, item=current)
+        get_session()["space_message"] = (
+            "Content published." if item.state == "public" else "Content updated."
+        )
+        return Redirect(content_path(item) if item.state == "public" else "/owner/content")
+
+    @app.route("/owner/content/{item_id}/delete", methods=["POST"])
+    async def content_delete(request: Request, item_id: str):
+        if viewer(request) is None:
+            return Redirect("/login")
+        form = await request.form()
+        if str(form.get("confirm", "")) != "delete":
+            get_session()["space_message"] = "Type delete to confirm content removal."
+            return Redirect(f"/owner/content/{item_id}/edit")
+        try:
+            publishing.delete(item_id, expected_revision=int(str(form.get("revision", "0"))))
+        except (RuntimeError, ValueError) as exc:
+            get_session()["space_message"] = str(exc)
+            return Redirect(f"/owner/content/{item_id}/edit")
+        get_session()["space_message"] = "Content deleted; its stable permalink is a tombstone."
+        return Redirect("/owner/content")
+
+    @app.route("/owner/guestbook/{entry_id}", methods=["POST"])
+    async def guestbook_moderate(request: Request, entry_id: str):
+        if viewer(request) is None:
+            return Redirect("/login")
+        form = await request.form()
+        try:
+            guestbook.moderate(entry_id, str(form.get("action", "")))
+        except (RuntimeError, ValueError) as exc:
+            get_session()["space_message"] = str(exc)
+        else:
+            get_session()["space_message"] = "Guestbook moderation updated."
+        return Redirect("/owner/content")
 
     @app.route("/owner/customize", template="customize.html")
     def customize_page(request: Request):
