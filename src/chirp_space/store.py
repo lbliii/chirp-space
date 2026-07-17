@@ -5,21 +5,28 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import Protocol
 
 from chirp_space.models import (
+    Delivery,
+    DeliveryJob,
     FederationKey,
     InboxReceipt,
+    OutboundActivity,
     Owner,
     ProfileModule,
+    QueueHealth,
     SiteSettings,
     SiteState,
     Theme,
 )
+
+MAX_ACTIVE_DELIVERIES = 10_000
 
 SQLITE_MIGRATION = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -84,10 +91,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_key_active
 CREATE TABLE IF NOT EXISTS inbox_receipts (
     signature_hash TEXT PRIMARY KEY,
     activity_id TEXT NOT NULL UNIQUE,
+    body_hash TEXT NOT NULL,
     activity_type TEXT NOT NULL,
     status TEXT NOT NULL,
     diagnostic TEXT NOT NULL,
     received_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS outbound_activities (
+    id TEXT PRIMARY KEY,
+    actor_id TEXT NOT NULL,
+    activity_type TEXT NOT NULL,
+    object_id TEXT,
+    body BLOB NOT NULL,
+    body_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deliveries (
+    id TEXT PRIMARY KEY,
+    activity_id TEXT NOT NULL REFERENCES outbound_activities(id) ON DELETE CASCADE,
+    inbox_url TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'retrying', 'delivered', 'dead', 'discarded')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(activity_id, inbox_url)
+);
+CREATE INDEX IF NOT EXISTS idx_deliveries_due
+    ON deliveries(status, next_attempt_at, inbox_url, created_at);
+CREATE TABLE IF NOT EXISTS delivery_peers (
+    inbox_url TEXT PRIMARY KEY,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    circuit_open_until TEXT,
+    updated_at TEXT NOT NULL
 );
 """
 
@@ -154,10 +191,42 @@ POSTGRES_MIGRATION = (
     """CREATE TABLE IF NOT EXISTS inbox_receipts (
         signature_hash TEXT PRIMARY KEY,
         activity_id TEXT NOT NULL UNIQUE,
+        body_hash TEXT NOT NULL,
         activity_type TEXT NOT NULL,
         status TEXT NOT NULL,
         diagnostic TEXT NOT NULL,
         received_at TIMESTAMPTZ NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS outbound_activities (
+        id TEXT PRIMARY KEY,
+        actor_id TEXT NOT NULL,
+        activity_type TEXT NOT NULL,
+        object_id TEXT,
+        body BYTEA NOT NULL,
+        body_hash TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS deliveries (
+        id UUID PRIMARY KEY,
+        activity_id TEXT NOT NULL REFERENCES outbound_activities(id) ON DELETE CASCADE,
+        inbox_url TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+            status IN ('pending', 'retrying', 'delivered', 'dead', 'discarded')
+        ),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        next_attempt_at TIMESTAMPTZ NOT NULL,
+        last_error TEXT,
+        created_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL,
+        UNIQUE(activity_id, inbox_url)
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_deliveries_due
+        ON deliveries(status, next_attempt_at, inbox_url, created_at)""",
+    """CREATE TABLE IF NOT EXISTS delivery_peers (
+        inbox_url TEXT PRIMARY KEY,
+        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        circuit_open_until TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL
     )""",
 )
 
@@ -196,22 +265,46 @@ class Store(Protocol):
     def federation_key(self, key_id: str) -> FederationKey | None: ...
     def create_federation_key(self, key: FederationKey) -> None: ...
     def rotate_federation_key(self, key: FederationKey, *, retired_at: datetime) -> None: ...
-    def record_inbox_receipt(self, receipt: InboxReceipt) -> bool: ...
+    def record_inbox_receipt(self, receipt: InboxReceipt) -> str: ...
     def inbox_receipts(self) -> tuple[InboxReceipt, ...]: ...
+    def enqueue_activity(
+        self, activity: OutboundActivity, inbox_urls: Sequence[str]
+    ) -> tuple[Delivery, ...]: ...
+    def due_delivery_jobs(self, *, now: datetime, limit: int) -> tuple[DeliveryJob, ...]: ...
+    def update_delivery(
+        self, delivery: Delivery, *, circuit_open_until: datetime | None = None
+    ) -> None: ...
+    def delivery(self, delivery_id: str) -> Delivery | None: ...
+    def retry_delivery(self, delivery_id: str, *, now: datetime) -> bool: ...
+    def discard_delivery(self, delivery_id: str, *, now: datetime) -> bool: ...
+    def queue_health(self, *, now: datetime) -> QueueHealth: ...
 
 
 class SQLiteStore:
     """Persistent local adapter used for development and deterministic proof."""
 
-    def __init__(self, path: str | Path = ":memory:") -> None:
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        max_active_deliveries: int = MAX_ACTIVE_DELIVERIES,
+    ) -> None:
         self._connection = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.row_factory = sqlite3.Row
         self._lock = RLock()
+        self._max_active_deliveries = max_active_deliveries
 
     def migrate(self) -> None:
         with self._lock:
             self._connection.executescript(SQLITE_MIGRATION)
+            inbox_columns = {
+                str(row[1]) for row in self._connection.execute("PRAGMA table_info(inbox_receipts)")
+            }
+            if "body_hash" not in inbox_columns:
+                self._connection.execute(
+                    "ALTER TABLE inbox_receipts ADD COLUMN body_hash TEXT NOT NULL DEFAULT ''"
+                )
             self._connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (1, ?, ?)",
                 ("local identity and customization foundation", _iso(datetime.now(UTC))),
@@ -219,6 +312,10 @@ class SQLiteStore:
             self._connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (2, ?, ?)",
                 ("federation identity and inbox receipts", _iso(datetime.now(UTC))),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (3, ?, ?)",
+                ("durable federation activities and deliveries", _iso(datetime.now(UTC))),
             )
 
     def close(self) -> None:
@@ -487,16 +584,18 @@ class SQLiteStore:
                 self._connection.execute("ROLLBACK")
                 raise
 
-    def record_inbox_receipt(self, receipt: InboxReceipt) -> bool:
+    def record_inbox_receipt(self, receipt: InboxReceipt) -> str:
         with self._lock:
             try:
                 self._connection.execute(
                     """INSERT INTO inbox_receipts(
-                        signature_hash, activity_id, activity_type, status, diagnostic, received_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        signature_hash, activity_id, body_hash, activity_type,
+                        status, diagnostic, received_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         receipt.signature_hash,
                         receipt.activity_id,
+                        receipt.body_hash,
                         receipt.activity_type,
                         receipt.status,
                         receipt.diagnostic,
@@ -504,18 +603,32 @@ class SQLiteStore:
                     ),
                 )
             except sqlite3.IntegrityError:
-                return False
-        return True
+                replay = self._connection.execute(
+                    "SELECT 1 FROM inbox_receipts WHERE signature_hash = ?",
+                    (receipt.signature_hash,),
+                ).fetchone()
+                if replay is not None:
+                    return "replay"
+                existing = self._connection.execute(
+                    "SELECT body_hash FROM inbox_receipts WHERE activity_id = ?",
+                    (receipt.activity_id,),
+                ).fetchone()
+                if existing is not None:
+                    return "duplicate" if existing[0] == receipt.body_hash else "conflict"
+                return "replay"
+        return "created"
 
     def inbox_receipts(self) -> tuple[InboxReceipt, ...]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT * FROM inbox_receipts ORDER BY received_at"
+                """SELECT signature_hash, activity_id, body_hash, activity_type,
+                status, diagnostic, received_at FROM inbox_receipts ORDER BY received_at"""
             ).fetchall()
         return tuple(
             InboxReceipt(
                 signature_hash=str(row["signature_hash"]),
                 activity_id=str(row["activity_id"]),
+                body_hash=str(row["body_hash"]),
                 activity_type=str(row["activity_type"]),
                 status=str(row["status"]),
                 diagnostic=str(row["diagnostic"]),
@@ -524,19 +637,249 @@ class SQLiteStore:
             for row in rows
         )
 
+    def enqueue_activity(
+        self, activity: OutboundActivity, inbox_urls: Sequence[str]
+    ) -> tuple[Delivery, ...]:
+        if len(inbox_urls) > 500:
+            raise ValueError("Federation fan-out cannot exceed 500 inboxes.")
+        destinations = tuple(dict.fromkeys(inbox_urls))
+        now = activity.created_at
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                existing = self._connection.execute(
+                    "SELECT body FROM outbound_activities WHERE id = ?", (activity.id,)
+                ).fetchone()
+                if existing is None:
+                    self._connection.execute(
+                        """INSERT INTO outbound_activities(
+                            id, actor_id, activity_type, object_id, body, body_hash, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            activity.id,
+                            activity.actor_id,
+                            activity.activity_type,
+                            activity.object_id,
+                            activity.body,
+                            hashlib.sha256(activity.body).hexdigest(),
+                            _iso(activity.created_at),
+                        ),
+                    )
+                elif bytes(existing[0]) != activity.body:
+                    raise RuntimeError("Outbound activity ID already has different content.")
+                existing_destinations = {
+                    str(row[0])
+                    for row in self._connection.execute(
+                        "SELECT inbox_url FROM deliveries WHERE activity_id = ?", (activity.id,)
+                    )
+                }
+                new_delivery_count = len(set(destinations) - existing_destinations)
+                active_row = self._connection.execute(
+                    """SELECT COUNT(*) FROM deliveries
+                    WHERE status IN ('pending', 'retrying')"""
+                ).fetchone()
+                active_count = int(active_row[0]) if active_row is not None else 0
+                if active_count + new_delivery_count > self._max_active_deliveries:
+                    raise RuntimeError("Federation delivery queue is full.")
+                for inbox_url in destinations:
+                    self._connection.execute(
+                        """INSERT OR IGNORE INTO deliveries(
+                            id, activity_id, inbox_url, status, attempts, next_attempt_at,
+                            last_error, created_at, updated_at
+                        ) VALUES (?, ?, ?, 'pending', 0, ?, NULL, ?, ?)""",
+                        (
+                            str(uuid.uuid7()),
+                            activity.id,
+                            inbox_url,
+                            _iso(now),
+                            _iso(now),
+                            _iso(now),
+                        ),
+                    )
+                rows = self._connection.execute(
+                    "SELECT * FROM deliveries WHERE activity_id = ? ORDER BY inbox_url",
+                    (activity.id,),
+                ).fetchall()
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return tuple(_delivery_from_mapping(row) for row in rows)
+
+    def due_delivery_jobs(self, *, now: datetime, limit: int) -> tuple[DeliveryJob, ...]:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                rows = self._connection.execute(
+                    """SELECT
+                        d.id AS delivery_id, d.activity_id, d.inbox_url, d.status, d.attempts,
+                        d.next_attempt_at, d.last_error, d.created_at AS delivery_created_at,
+                        d.updated_at, a.actor_id, a.activity_type, a.object_id, a.body,
+                        a.created_at AS activity_created_at
+                    FROM deliveries d
+                    JOIN outbound_activities a ON a.id = d.activity_id
+                    LEFT JOIN delivery_peers p ON p.inbox_url = d.inbox_url
+                    WHERE d.status IN ('pending', 'retrying')
+                      AND d.next_attempt_at <= ?
+                      AND (p.circuit_open_until IS NULL OR p.circuit_open_until <= ?)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM deliveries earlier
+                        WHERE earlier.inbox_url = d.inbox_url
+                          AND earlier.status IN ('pending', 'retrying')
+                          AND (earlier.created_at < d.created_at OR (
+                            earlier.created_at = d.created_at AND earlier.id < d.id
+                          ))
+                      )
+                    ORDER BY d.next_attempt_at, d.created_at, d.id
+                    LIMIT ?""",
+                    (_iso(now), _iso(now), max(0, limit)),
+                ).fetchall()
+                lease_until = _iso(now + timedelta(minutes=5))
+                self._connection.executemany(
+                    "UPDATE deliveries SET next_attempt_at = ? WHERE id = ?",
+                    [(lease_until, str(row["delivery_id"])) for row in rows],
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return tuple(_delivery_job_from_mapping(row) for row in rows)
+
+    def update_delivery(
+        self, delivery: Delivery, *, circuit_open_until: datetime | None = None
+    ) -> None:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                updated = self._connection.execute(
+                    """UPDATE deliveries SET status = ?, attempts = ?, next_attempt_at = ?,
+                    last_error = ?, updated_at = ? WHERE id = ?""",
+                    (
+                        delivery.status,
+                        delivery.attempts,
+                        _iso(delivery.next_attempt_at),
+                        delivery.last_error,
+                        _iso(delivery.updated_at),
+                        delivery.id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("Federation delivery no longer exists.")
+                if delivery.status == "delivered":
+                    self._connection.execute(
+                        """INSERT INTO delivery_peers(
+                            inbox_url, consecutive_failures, circuit_open_until, updated_at
+                        ) VALUES (?, 0, NULL, ?)
+                        ON CONFLICT(inbox_url) DO UPDATE SET
+                            consecutive_failures = 0, circuit_open_until = NULL,
+                            updated_at = excluded.updated_at""",
+                        (delivery.inbox_url, _iso(delivery.updated_at)),
+                    )
+                elif delivery.status in {"retrying", "dead"}:
+                    self._connection.execute(
+                        """INSERT INTO delivery_peers(
+                            inbox_url, consecutive_failures, circuit_open_until, updated_at
+                        ) VALUES (?, 1, ?, ?)
+                        ON CONFLICT(inbox_url) DO UPDATE SET
+                            consecutive_failures = delivery_peers.consecutive_failures + 1,
+                            circuit_open_until = COALESCE(
+                                excluded.circuit_open_until, delivery_peers.circuit_open_until
+                            ),
+                            updated_at = excluded.updated_at""",
+                        (
+                            delivery.inbox_url,
+                            _iso(circuit_open_until) if circuit_open_until else None,
+                            _iso(delivery.updated_at),
+                        ),
+                    )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    def delivery(self, delivery_id: str) -> Delivery | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM deliveries WHERE id = ?", (delivery_id,)
+            ).fetchone()
+        return _delivery_from_mapping(row) if row is not None else None
+
+    def retry_delivery(self, delivery_id: str, *, now: datetime) -> bool:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT inbox_url FROM deliveries WHERE id = ? AND status = 'dead'",
+                    (delivery_id,),
+                ).fetchone()
+                if row is None:
+                    self._connection.execute("COMMIT")
+                    return False
+                self._connection.execute(
+                    """UPDATE deliveries SET status = 'pending', attempts = 0,
+                    next_attempt_at = ?, last_error = NULL, created_at = ?, updated_at = ?
+                    WHERE id = ?""",
+                    (_iso(now), _iso(now), _iso(now), delivery_id),
+                )
+                self._connection.execute(
+                    """UPDATE delivery_peers SET consecutive_failures = 0,
+                    circuit_open_until = NULL, updated_at = ? WHERE inbox_url = ?""",
+                    (_iso(now), str(row[0])),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return True
+
+    def discard_delivery(self, delivery_id: str, *, now: datetime) -> bool:
+        with self._lock:
+            updated = self._connection.execute(
+                """UPDATE deliveries SET status = 'discarded', updated_at = ?
+                WHERE id = ? AND status IN ('pending', 'retrying', 'dead')""",
+                (_iso(now), delivery_id),
+            )
+        return updated.rowcount == 1
+
+    def queue_health(self, *, now: datetime) -> QueueHealth:
+        with self._lock:
+            counts = {
+                str(row[0]): int(row[1])
+                for row in self._connection.execute(
+                    "SELECT status, COUNT(*) FROM deliveries GROUP BY status"
+                )
+            }
+            circuits = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM delivery_peers WHERE circuit_open_until > ?",
+                    (_iso(now),),
+                ).fetchone()[0]
+            )
+        return _queue_health(counts, circuits)
+
 
 class PostgresStore:
     """Production PostgreSQL adapter with transactional single-owner setup."""
 
-    def __init__(self, database_url: str) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        max_active_deliveries: int = MAX_ACTIVE_DELIVERIES,
+    ) -> None:
         from psycopg_pool import ConnectionPool
 
         self._pool = ConnectionPool(database_url, min_size=1, max_size=5, open=True)
+        self._max_active_deliveries = max_active_deliveries
 
     def migrate(self) -> None:
         with self._pool.connection() as connection, connection.transaction():
             for statement in POSTGRES_MIGRATION:
                 connection.execute(statement)
+            connection.execute(
+                """ALTER TABLE inbox_receipts
+                ADD COLUMN IF NOT EXISTS body_hash TEXT NOT NULL DEFAULT ''"""
+            )
             connection.execute(
                 """INSERT INTO schema_migrations(version, name) VALUES (1, %s)
                 ON CONFLICT (version) DO NOTHING""",
@@ -546,6 +889,11 @@ class PostgresStore:
                 """INSERT INTO schema_migrations(version, name) VALUES (2, %s)
                 ON CONFLICT (version) DO NOTHING""",
                 ("federation identity and inbox receipts",),
+            )
+            connection.execute(
+                """INSERT INTO schema_migrations(version, name) VALUES (3, %s)
+                ON CONFLICT (version) DO NOTHING""",
+                ("durable federation activities and deliveries",),
             )
 
     def close(self) -> None:
@@ -771,30 +1119,238 @@ class PostgresStore:
                 (key.id, key.public_pem, key.encrypted_private_pem, key.created_at),
             )
 
-    def record_inbox_receipt(self, receipt: InboxReceipt) -> bool:
-        with self._pool.connection() as connection:
+    def record_inbox_receipt(self, receipt: InboxReceipt) -> str:
+        with self._pool.connection() as connection, connection.transaction():
             row = connection.execute(
                 """INSERT INTO inbox_receipts(
-                    signature_hash, activity_id, activity_type, status, diagnostic, received_at
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    signature_hash, activity_id, body_hash, activity_type,
+                    status, diagnostic, received_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING RETURNING signature_hash""",
                 (
                     receipt.signature_hash,
                     receipt.activity_id,
+                    receipt.body_hash,
                     receipt.activity_type,
                     receipt.status,
                     receipt.diagnostic,
                     receipt.received_at,
                 ),
             ).fetchone()
-        return row is not None
+            if row is not None:
+                return "created"
+            replay = connection.execute(
+                "SELECT 1 FROM inbox_receipts WHERE signature_hash = %s",
+                (receipt.signature_hash,),
+            ).fetchone()
+            if replay is not None:
+                return "replay"
+            existing = connection.execute(
+                "SELECT body_hash FROM inbox_receipts WHERE activity_id = %s",
+                (receipt.activity_id,),
+            ).fetchone()
+            if existing is not None:
+                return "duplicate" if existing[0] == receipt.body_hash else "conflict"
+            return "replay"
 
     def inbox_receipts(self) -> tuple[InboxReceipt, ...]:
         with self._pool.connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM inbox_receipts ORDER BY received_at"
+                """SELECT signature_hash, activity_id, body_hash, activity_type,
+                status, diagnostic, received_at FROM inbox_receipts ORDER BY received_at"""
             ).fetchall()
         return tuple(_inbox_receipt_from_sequence(row) for row in rows)
+
+    def enqueue_activity(
+        self, activity: OutboundActivity, inbox_urls: Sequence[str]
+    ) -> tuple[Delivery, ...]:
+        if len(inbox_urls) > 500:
+            raise ValueError("Federation fan-out cannot exceed 500 inboxes.")
+        destinations = tuple(dict.fromkeys(inbox_urls))
+        with self._pool.connection() as connection, connection.transaction():
+            connection.execute("SELECT pg_advisory_xact_lock(794)")
+            existing = connection.execute(
+                "SELECT body FROM outbound_activities WHERE id = %s", (activity.id,)
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO outbound_activities(
+                        id, actor_id, activity_type, object_id, body, body_hash, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        activity.id,
+                        activity.actor_id,
+                        activity.activity_type,
+                        activity.object_id,
+                        activity.body,
+                        hashlib.sha256(activity.body).hexdigest(),
+                        activity.created_at,
+                    ),
+                )
+            elif bytes(existing[0]) != activity.body:
+                raise RuntimeError("Outbound activity ID already has different content.")
+            existing_destinations = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT inbox_url FROM deliveries WHERE activity_id = %s", (activity.id,)
+                ).fetchall()
+            }
+            new_delivery_count = len(set(destinations) - existing_destinations)
+            active_row = connection.execute(
+                """SELECT COUNT(*) FROM deliveries
+                WHERE status IN ('pending', 'retrying')"""
+            ).fetchone()
+            active_count = int(active_row[0]) if active_row is not None else 0
+            if active_count + new_delivery_count > self._max_active_deliveries:
+                raise RuntimeError("Federation delivery queue is full.")
+            for inbox_url in destinations:
+                connection.execute(
+                    """INSERT INTO deliveries(
+                        id, activity_id, inbox_url, status, attempts, next_attempt_at,
+                        last_error, created_at, updated_at
+                    ) VALUES (%s, %s, %s, 'pending', 0, %s, NULL, %s, %s)
+                    ON CONFLICT (activity_id, inbox_url) DO NOTHING""",
+                    (
+                        str(uuid.uuid7()),
+                        activity.id,
+                        inbox_url,
+                        activity.created_at,
+                        activity.created_at,
+                        activity.created_at,
+                    ),
+                )
+            rows = connection.execute(
+                """SELECT id, activity_id, inbox_url, status, attempts, next_attempt_at,
+                last_error, created_at, updated_at FROM deliveries
+                WHERE activity_id = %s ORDER BY inbox_url""",
+                (activity.id,),
+            ).fetchall()
+        return tuple(_delivery_from_sequence(row) for row in rows)
+
+    def due_delivery_jobs(self, *, now: datetime, limit: int) -> tuple[DeliveryJob, ...]:
+        with self._pool.connection() as connection, connection.transaction():
+            rows = connection.execute(
+                """SELECT
+                    d.id, d.activity_id, d.inbox_url, d.status, d.attempts,
+                    d.next_attempt_at, d.last_error, d.created_at, d.updated_at,
+                    a.actor_id, a.activity_type, a.object_id, a.body, a.created_at
+                FROM deliveries d
+                JOIN outbound_activities a ON a.id = d.activity_id
+                LEFT JOIN delivery_peers p ON p.inbox_url = d.inbox_url
+                WHERE d.status IN ('pending', 'retrying')
+                  AND d.next_attempt_at <= %s
+                  AND (p.circuit_open_until IS NULL OR p.circuit_open_until <= %s)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM deliveries earlier
+                    WHERE earlier.inbox_url = d.inbox_url
+                      AND earlier.status IN ('pending', 'retrying')
+                      AND (earlier.created_at < d.created_at OR (
+                        earlier.created_at = d.created_at AND earlier.id < d.id
+                      ))
+                )
+                ORDER BY d.next_attempt_at, d.created_at, d.id
+                LIMIT %s
+                FOR UPDATE OF d SKIP LOCKED""",
+                (now, now, max(0, limit)),
+            ).fetchall()
+            lease_until = now + timedelta(minutes=5)
+            connection.cursor().executemany(
+                "UPDATE deliveries SET next_attempt_at = %s WHERE id = %s",
+                [(lease_until, row[0]) for row in rows],
+            )
+        return tuple(_delivery_job_from_sequence(row) for row in rows)
+
+    def update_delivery(
+        self, delivery: Delivery, *, circuit_open_until: datetime | None = None
+    ) -> None:
+        with self._pool.connection() as connection, connection.transaction():
+            updated = connection.execute(
+                """UPDATE deliveries SET status = %s, attempts = %s,
+                next_attempt_at = %s, last_error = %s, updated_at = %s
+                WHERE id = %s RETURNING id""",
+                (
+                    delivery.status,
+                    delivery.attempts,
+                    delivery.next_attempt_at,
+                    delivery.last_error,
+                    delivery.updated_at,
+                    delivery.id,
+                ),
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError("Federation delivery no longer exists.")
+            if delivery.status == "delivered":
+                connection.execute(
+                    """INSERT INTO delivery_peers(
+                        inbox_url, consecutive_failures, circuit_open_until, updated_at
+                    ) VALUES (%s, 0, NULL, %s)
+                    ON CONFLICT(inbox_url) DO UPDATE SET
+                        consecutive_failures = 0, circuit_open_until = NULL,
+                        updated_at = excluded.updated_at""",
+                    (delivery.inbox_url, delivery.updated_at),
+                )
+            elif delivery.status in {"retrying", "dead"}:
+                connection.execute(
+                    """INSERT INTO delivery_peers(
+                        inbox_url, consecutive_failures, circuit_open_until, updated_at
+                    ) VALUES (%s, 1, %s, %s)
+                    ON CONFLICT(inbox_url) DO UPDATE SET
+                        consecutive_failures = delivery_peers.consecutive_failures + 1,
+                        circuit_open_until = COALESCE(
+                            excluded.circuit_open_until, delivery_peers.circuit_open_until
+                        ),
+                        updated_at = excluded.updated_at""",
+                    (delivery.inbox_url, circuit_open_until, delivery.updated_at),
+                )
+
+    def delivery(self, delivery_id: str) -> Delivery | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """SELECT id, activity_id, inbox_url, status, attempts, next_attempt_at,
+                last_error, created_at, updated_at FROM deliveries WHERE id = %s""",
+                (delivery_id,),
+            ).fetchone()
+        return _delivery_from_sequence(row) if row is not None else None
+
+    def retry_delivery(self, delivery_id: str, *, now: datetime) -> bool:
+        with self._pool.connection() as connection, connection.transaction():
+            row = connection.execute(
+                """UPDATE deliveries SET status = 'pending', attempts = 0,
+                next_attempt_at = %s, last_error = NULL, created_at = %s, updated_at = %s
+                WHERE id = %s AND status = 'dead' RETURNING inbox_url""",
+                (now, now, now, delivery_id),
+            ).fetchone()
+            if row is not None:
+                connection.execute(
+                    """UPDATE delivery_peers SET consecutive_failures = 0,
+                    circuit_open_until = NULL, updated_at = %s WHERE inbox_url = %s""",
+                    (now, row[0]),
+                )
+        return row is not None
+
+    def discard_delivery(self, delivery_id: str, *, now: datetime) -> bool:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """UPDATE deliveries SET status = 'discarded', updated_at = %s
+                WHERE id = %s AND status IN ('pending', 'retrying', 'dead') RETURNING id""",
+                (now, delivery_id),
+            ).fetchone()
+        return row is not None
+
+    def queue_health(self, *, now: datetime) -> QueueHealth:
+        with self._pool.connection() as connection:
+            counts = {
+                str(row[0]): int(row[1])
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) FROM deliveries GROUP BY status"
+                ).fetchall()
+            }
+            circuit_row = connection.execute(
+                "SELECT COUNT(*) FROM delivery_peers WHERE circuit_open_until > %s",
+                (now,),
+            ).fetchone()
+            circuits = int(circuit_row[0]) if circuit_row is not None else 0
+        return _queue_health(counts, circuits)
 
 
 def store_from_url(database_url: str) -> Store:
@@ -930,8 +1486,93 @@ def _inbox_receipt_from_sequence(row: Sequence[object]) -> InboxReceipt:
     return InboxReceipt(
         signature_hash=str(row[0]),
         activity_id=str(row[1]),
-        activity_type=str(row[2]),
-        status=str(row[3]),
-        diagnostic=str(row[4]),
-        received_at=_datetime(row[5]),
+        body_hash=str(row[2]),
+        activity_type=str(row[3]),
+        status=str(row[4]),
+        diagnostic=str(row[5]),
+        received_at=_datetime(row[6]),
     )
+
+
+def _delivery_from_mapping(row: sqlite3.Row) -> Delivery:
+    return Delivery(
+        id=str(row["id"]),
+        activity_id=str(row["activity_id"]),
+        inbox_url=str(row["inbox_url"]),
+        status=str(row["status"]),
+        attempts=int(row["attempts"]),
+        next_attempt_at=_datetime(row["next_attempt_at"]),
+        last_error=str(row["last_error"]) if row["last_error"] else None,
+        created_at=_datetime(row["created_at"]),
+        updated_at=_datetime(row["updated_at"]),
+    )
+
+
+def _delivery_from_sequence(row: Sequence[object]) -> Delivery:
+    return Delivery(
+        id=str(row[0]),
+        activity_id=str(row[1]),
+        inbox_url=str(row[2]),
+        status=str(row[3]),
+        attempts=int(str(row[4])),
+        next_attempt_at=_datetime(row[5]),
+        last_error=str(row[6]) if row[6] else None,
+        created_at=_datetime(row[7]),
+        updated_at=_datetime(row[8]),
+    )
+
+
+def _delivery_job_from_mapping(row: sqlite3.Row) -> DeliveryJob:
+    delivery = Delivery(
+        id=str(row["delivery_id"]),
+        activity_id=str(row["activity_id"]),
+        inbox_url=str(row["inbox_url"]),
+        status=str(row["status"]),
+        attempts=int(row["attempts"]),
+        next_attempt_at=_datetime(row["next_attempt_at"]),
+        last_error=str(row["last_error"]) if row["last_error"] else None,
+        created_at=_datetime(row["delivery_created_at"]),
+        updated_at=_datetime(row["updated_at"]),
+    )
+    activity = OutboundActivity(
+        id=str(row["activity_id"]),
+        actor_id=str(row["actor_id"]),
+        activity_type=str(row["activity_type"]),
+        object_id=str(row["object_id"]) if row["object_id"] else None,
+        body=bytes(row["body"]),
+        created_at=_datetime(row["activity_created_at"]),
+    )
+    return DeliveryJob(delivery, activity)
+
+
+def _delivery_job_from_sequence(row: Sequence[object]) -> DeliveryJob:
+    return DeliveryJob(
+        _delivery_from_sequence(row[:9]),
+        OutboundActivity(
+            id=str(row[1]),
+            actor_id=str(row[9]),
+            activity_type=str(row[10]),
+            object_id=str(row[11]) if row[11] else None,
+            body=_bytes(row[12]),
+            created_at=_datetime(row[13]),
+        ),
+    )
+
+
+def _queue_health(counts: dict[str, int], circuits: int) -> QueueHealth:
+    return QueueHealth(
+        pending=counts.get("pending", 0),
+        retrying=counts.get("retrying", 0),
+        delivered=counts.get("delivered", 0),
+        dead=counts.get("dead", 0),
+        discarded=counts.get("discarded", 0),
+        open_circuits=circuits,
+    )
+
+
+def _bytes(value: object) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, (bytearray, memoryview)):
+        return bytes(value)
+    raise TypeError("Database binary value is not bytes-like.")

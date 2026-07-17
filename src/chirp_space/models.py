@@ -100,7 +100,47 @@ class FederationKey:
 class InboxReceipt:
     signature_hash: str
     activity_id: str
+    body_hash: str
     activity_type: str
     status: str
     diagnostic: str
     received_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundActivity:
+    id: str
+    actor_id: str
+    activity_type: str
+    object_id: str | None
+    body: bytes
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class Delivery:
+    id: str
+    activity_id: str
+    inbox_url: str
+    status: str
+    attempts: int
+    next_attempt_at: datetime
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryJob:
+    delivery: Delivery
+    activity: OutboundActivity
+
+
+@dataclass(frozen=True, slots=True)
+class QueueHealth:
+    pending: int
+    retrying: int
+    delivered: int
+    dead: int
+    discarded: int
+    open_circuits: int

@@ -248,6 +248,8 @@ def test_json_and_ssrf_boundaries_fail_before_remote_io() -> None:
         parse_json_object(b'{"id":"one","id":"two"}')
     with pytest.raises(FederationError, match="JSON object"):
         parse_json_object(b"[]")
+    with pytest.raises(FederationError, match="not finite"):
+        parse_json_object(b'{"value":NaN}')
     nested: object = "leaf"
     for _ in range(33):
         nested = [nested]
