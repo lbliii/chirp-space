@@ -1,0 +1,48 @@
+{# target: body #}
+{# outlet: main #}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <meta name="theme-color" content="#f4f0e7">
+  <title>{% block title %}{% if state %}{{ state.owner.display_name }} · Chirp Space{% else %}Chirp Space setup pending{% end %}{% end %}</title>
+  <link rel="canonical" href="{{ canonical_origin }}{{ current_path }}">
+  <link rel="stylesheet" href="/space-static/space.css?v=1">
+</head>
+<body class="{% if state %}{{ state.settings.theme.class_names }}{% else %}theme-system font-system scale-standard density-comfortable radius-soft width-standard{% end %}" hx-boost="true" hx-target="#page-root" hx-swap="outerHTML show:top">
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <header class="site-header">
+    <div class="shell header-inner">
+      <a class="brand" href="/">{% if state %}{{ state.owner.display_name }}{% else %}Chirp Space{% end %}</a>
+      <nav aria-label="Primary navigation">
+        <a href="/">Home</a>
+        {% if viewer %}
+          <a href="/owner/customize">Customize</a>
+          <a href="/owner">Owner</a>
+          <form method="post" action="/logout" hx-boost="false">
+            {{ csrf_field() }}
+            <button class="link-button" type="submit">Sign out</button>
+          </form>
+        {% elif state %}
+          <a href="/login">Owner sign in</a>
+        {% else %}
+          <a href="/setup">Claim this Space</a>
+        {% end %}
+      </nav>
+    </div>
+  </header>
+  {% block page_root %}
+  <main id="page-root" class="shell page-shell" tabindex="-1">
+    <div id="main-content">
+      {% block page_content %}{% end %}
+    </div>
+  </main>
+  {% end %}
+  <footer class="shell site-footer">
+    <span>One owner · one home on the web</span>
+    <a href="https://lbliii.github.io/chirp/">Built with Chirp <span aria-hidden="true">↗</span></a>
+  </footer>
+</body>
+</html>

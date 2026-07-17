@@ -1,0 +1,9 @@
+<article class="profile" aria-label="Profile preview">
+  {% for module in preview.modules %}
+    {% if module.enabled %}
+      {% if module.kind == "identity" %}<header class="profile-identity"><p class="eyebrow">@{{ preview.owner.handle }}</p><h3>{{ preview.owner.display_name }}</h3>{% if module.config.tagline %}<p class="tagline">{{ module.config.tagline }}</p>{% end %}{% if preview.owner.bio %}<p>{{ preview.owner.bio }}</p>{% end %}</header>
+      {% elif module.kind == "links" and module.config.items %}<section><h3>Elsewhere</h3><ul class="link-list">{% for link in module.config.items %}<li><a href="{{ link.url }}" rel="noopener noreferrer">{{ link.label }}</a></li>{% end %}</ul></section>
+      {% else %}<section><h3>{{ module.kind.replace("_", " ").title() }}</h3><p class="empty-state">Module preview</p></section>{% end %}
+    {% end %}
+  {% end %}
+</article>

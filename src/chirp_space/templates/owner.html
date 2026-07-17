@@ -1,0 +1,23 @@
+{% extends "layout.html" %}
+{% block title %}Owner dashboard · {{ state.owner.display_name }}{% end %}
+{% block page_content %}
+<header class="page-heading">
+  <p class="eyebrow">Owner dashboard</p>
+  <h1>Your Space is claimed</h1>
+  <p>Stable site ID <code>{{ state.settings.id }}</code> · owner ID <code>{{ state.owner.id }}</code></p>
+</header>
+{% if message %}<div class="notice" role="status">{{ message }}</div>{% end %}
+{% if recovery_codes %}
+<section class="critical-card" aria-labelledby="recovery-title">
+  <h2 id="recovery-title">Save these recovery codes now</h2>
+  <p>Each code works once. They will not be shown again.</p>
+  <ul class="recovery-codes">
+    {% for code in recovery_codes %}<li><code>{{ code }}</code></li>{% end %}
+  </ul>
+</section>
+{% end %}
+<div class="card-grid">
+  <section class="card"><h2>Public profile</h2><p>Your stable profile path is <code>/@{{ state.owner.handle }}</code>.</p><a class="button" href="/@{{ state.owner.handle }}">View profile</a></section>
+  <section class="card"><h2>Customize</h2><p>Choose accessible theme tokens and arrange built-in profile modules.</p><a class="button" href="/owner/customize">Customize profile</a></section>
+</div>
+{% end %}

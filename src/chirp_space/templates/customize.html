@@ -1,0 +1,81 @@
+{% extends "layout.html" %}
+{% block title %}Customize · {{ state.owner.display_name }}{% end %}
+{% block page_content %}
+<header class="page-heading">
+  <p class="eyebrow">Profile studio</p>
+  <h1>Customize without custom code</h1>
+  <p>Preview uses the same server-rendered profile as the public page. Only Save publishes it.</p>
+</header>
+{% if error %}<div class="notice error" role="alert" tabindex="-1">{{ error }}</div>{% end %}
+{% if message %}<div class="notice" role="status">{{ message }}</div>{% end %}
+{% if preview %}
+<section class="preview-frame" aria-labelledby="preview-title">
+  <h2 id="preview-title">Private preview</h2>
+  <div class="{{ preview.settings.theme.class_names }} preview-surface">
+    {% include "profile_preview.html" %}
+  </div>
+</section>
+{% end %}
+<form method="post" class="studio" hx-target="#page-root" hx-swap="outerHTML show:top">
+  {{ csrf_field() }}
+  <input type="hidden" name="revision" value="{{ values.revision }}">
+  <section class="form-card" aria-labelledby="identity-settings">
+    <h2 id="identity-settings">Identity</h2>
+    <label>Display name<input name="display_name" value="{{ values.display_name }}" maxlength="80" required></label>
+    <label>Tagline<input name="tagline" value="{{ values.tagline }}" maxlength="120"></label>
+    <label>Introduction<textarea name="bio" rows="4" maxlength="500">{{ values.bio }}</textarea></label>
+    <div class="form-grid">
+      <label>Location<input name="location" value="{{ values.location }}" maxlength="80"></label>
+      <label>Website<input name="website_url" type="url" value="{{ values.website_url }}" placeholder="https://example.com"></label>
+    </div>
+    <label>External links
+      <textarea name="links" rows="4" placeholder="Writing | https://example.com/writing">{{ values.links }}</textarea>
+      <small>One per line: <code>Label | https://example.com</code>. Maximum eight.</small>
+    </label>
+  </section>
+  <section class="form-card" aria-labelledby="theme-settings">
+    <h2 id="theme-settings">Accessible theme tokens</h2>
+    <div class="form-grid three">
+      <label>Palette<select name="palette"><option value="system" {% if values.palette == "system" %}selected{% end %}>Follow system</option><option value="light" {% if values.palette == "light" %}selected{% end %}>Light</option><option value="dark" {% if values.palette == "dark" %}selected{% end %}>Dark</option></select></label>
+      <label>Font<select name="font"><option value="system" {% if values.font == "system" %}selected{% end %}>System sans</option><option value="serif" {% if values.font == "serif" %}selected{% end %}>System serif</option></select></label>
+      <label>Type scale<select name="scale"><option value="compact" {% if values.scale == "compact" %}selected{% end %}>Compact</option><option value="standard" {% if values.scale == "standard" %}selected{% end %}>Standard</option><option value="generous" {% if values.scale == "generous" %}selected{% end %}>Generous</option></select></label>
+      <label>Density<select name="density"><option value="comfortable" {% if values.density == "comfortable" %}selected{% end %}>Comfortable</option><option value="compact" {% if values.density == "compact" %}selected{% end %}>Compact</option></select></label>
+      <label>Corners<select name="radius"><option value="soft" {% if values.radius == "soft" %}selected{% end %}>Soft</option><option value="square" {% if values.radius == "square" %}selected{% end %}>Square</option><option value="round" {% if values.radius == "round" %}selected{% end %}>Round</option></select></label>
+      <label>Page width<select name="layout_width"><option value="narrow" {% if values.layout_width == "narrow" %}selected{% end %}>Narrow</option><option value="standard" {% if values.layout_width == "standard" %}selected{% end %}>Standard</option><option value="wide" {% if values.layout_width == "wide" %}selected{% end %}>Wide</option></select></label>
+    </div>
+  </section>
+  <section class="form-card" aria-labelledby="module-settings">
+    <h2 id="module-settings">Profile modules</h2>
+    <label>Module order
+      <input name="module_order" value="{{ values.module_order }}" required>
+      <small>Comma-separated built-in module names. Each must appear exactly once.</small>
+    </label>
+    <fieldset><legend>Visible modules</legend><div class="check-grid">
+      <label><input type="checkbox" name="enable_identity" {% if values.enabled.identity %}checked{% end %}> Identity (required)</label>
+      <label><input type="checkbox" name="enable_links" {% if values.enabled.links %}checked{% end %}> External links</label>
+      <label><input type="checkbox" name="enable_featured" {% if values.enabled.featured %}checked{% end %}> Featured item</label>
+      <label><input type="checkbox" name="enable_recent_posts" {% if values.enabled.recent_posts %}checked{% end %}> Recent posts</label>
+      <label><input type="checkbox" name="enable_journal" {% if values.enabled.journal %}checked{% end %}> Journal list</label>
+      <label><input type="checkbox" name="enable_photos" {% if values.enabled.photos %}checked{% end %}> Photo grid</label>
+      <label><input type="checkbox" name="enable_tags" {% if values.enabled.tags %}checked{% end %}> Topics</label>
+      <label><input type="checkbox" name="enable_guestbook" {% if values.enabled.guestbook %}checked{% end %}> Guestbook</label>
+    </div></fieldset>
+    <div class="form-grid three">
+      <label>Recent post count<input name="recent_limit" type="number" min="1" max="12" value="{{ values.recent_limit }}"></label>
+      <label>Journal count<input name="journal_limit" type="number" min="1" max="12" value="{{ values.journal_limit }}"></label>
+      <label>Photo columns<input name="photo_columns" type="number" min="2" max="4" value="{{ values.photo_columns }}"></label>
+      <label>Topic count<input name="tag_limit" type="number" min="1" max="24" value="{{ values.tag_limit }}"></label>
+      <label>Featured content ID<input name="featured_id" value="{{ values.featured_id }}" placeholder="Available after publishing"></label>
+      <label>Guestbook prompt<input name="guestbook_prompt" value="{{ values.guestbook_prompt }}" maxlength="120"></label>
+    </div>
+  </section>
+  <div class="form-actions">
+    <button class="button" type="submit" name="intent" value="preview">Preview privately</button>
+    <button class="button primary" type="submit" name="intent" value="save">Save and publish</button>
+  </div>
+</form>
+<form method="post" action="/owner/customize/reset" class="reset-form" hx-boost="false">
+  {{ csrf_field() }}<input type="hidden" name="revision" value="{{ values.revision }}">
+  <button class="button danger" type="submit">Restore accessible defaults</button>
+</form>
+{% end %}

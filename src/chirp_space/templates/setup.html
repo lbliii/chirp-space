@@ -1,0 +1,40 @@
+{% extends "layout.html" %}
+{% block title %}Claim your Chirp Space{% end %}
+{% block page_content %}
+<div class="narrow">
+  <header class="page-heading">
+    <p class="eyebrow">First run</p>
+    <h1>Make this Space yours</h1>
+    <p>The one-time claim creates the only owner account and eight recovery codes. Save those codes offline; they are shown once.</p>
+  </header>
+  {% if error %}<div class="notice error" role="alert" tabindex="-1">{{ error }}</div>{% end %}
+  {% if show_development_hint %}<div class="notice">Local claim token: <code>development-owner-claim-token</code></div>{% end %}
+  <form method="post" class="form-card" hx-boost="false">
+    {{ csrf_field() }}
+    <label>Owner claim token
+      <input name="claim_token" type="password" autocomplete="off" required>
+      <small>Copy the generated <code>SPACE_OWNER_CLAIM_TOKEN</code> from your deployment variables.</small>
+    </label>
+    <label>Canonical origin
+      <input name="canonical_origin" type="url" value="{{ values.canonical_origin }}" required>
+      <small>This must match <code>SPACE_CANONICAL_ORIGIN</code>. It becomes the public identity origin.</small>
+    </label>
+    <div class="form-grid">
+      <label>Handle
+        <input name="handle" value="{{ values.handle }}" pattern="[a-z0-9][a-z0-9_-]{2,29}" autocomplete="username" required>
+      </label>
+      <label>Display name
+        <input name="display_name" value="{{ values.display_name }}" maxlength="80" required>
+      </label>
+    </div>
+    <label>Short introduction
+      <textarea name="bio" rows="4" maxlength="500">{{ values.bio }}</textarea>
+    </label>
+    <label>Password
+      <input name="password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required>
+      <small>Use 12–128 characters. There is no email recovery or support backdoor.</small>
+    </label>
+    <button class="button primary" type="submit">Create the owner account</button>
+  </form>
+</div>
+{% end %}
