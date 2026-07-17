@@ -10,5 +10,7 @@ def space_config() -> SpaceConfig:
         database_url="sqlite:///:memory:",
         secret_key="s" * 64,
         claim_token="owner-claim-token-for-tests",
+        key_encryption_key="federation-key-encryption-secret-for-tests",
         canonical_origin="http://localhost:8000",
+        federation_enabled=True,
     )

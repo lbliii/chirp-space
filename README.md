@@ -14,8 +14,23 @@ profile, and customize it through typed modules and constrained theme tokens.
 - Owner and site UUIDv7 identifiers survive display-name, handle, theme, and domain changes.
 - PostgreSQL is the production contract. SQLite supports local development and restart proof.
 
-Publishing, media, guestbook behavior, federation, relationships, export, deletion, and Railway
-template publication remain deliberately gated by their Chirp backlog issues.
+Publishing, media, guestbook behavior, relationships, export, deletion, and Railway template
+publication remain deliberately gated by their Chirp backlog issues.
+
+## Federation identity boundary
+
+Federation is dark by default. Set `SPACE_FEDERATION_ENABLED=true` only after the owner-facing
+consent gate is ready. The bounded protocol surface exposes WebFinger, one ActivityPub actor,
+one active RSA signing key, inbox/outbox endpoints, and followers/following collections. It does
+not yet advertise follows or publish posts.
+
+Private signing-key material is encrypted at rest with `SPACE_KEY_ENCRYPTION_KEY`. Signed inbox
+requests accept the deployed RSA-SHA256 HTTP Signature profile over
+`(request-target) host date digest` and the bounded RFC 9421 RSA profile; replayed activity IDs or
+signatures are accepted only once. Rotation is atomic and keeps retired public keys available for
+30 days without retaining them as signing keys.
+Remote key fetching is HTTPS-only, address-pinned, redirect-revalidated, size-bounded, and rejects
+private, loopback, link-local, multicast, reserved, or otherwise non-global destinations.
 
 ## Local development
 
@@ -47,6 +62,8 @@ SPACE_ENV=production
 SPACE_CANONICAL_ORIGIN=https://${{RAILWAY_PUBLIC_DOMAIN}}
 CHIRP_SECRET_KEY=${{ secret(32, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") }}
 SPACE_OWNER_CLAIM_TOKEN=${{ secret(32, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") }}
+SPACE_KEY_ENCRYPTION_KEY=${{ secret(32, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") }}
+SPACE_FEDERATION_ENABLED=false
 ```
 
 The app listens on Railway's `PORT`, uses `/ready` for deployment readiness, runs migrations as a

@@ -12,7 +12,7 @@ from chirp.config import AppConfig
 from chirp.health import HealthCheck
 from chirp.http.cookies import SetCookie
 from chirp.http.request import Request
-from chirp.http.response import Redirect, Response
+from chirp.http.response import JSONResponse, Redirect, Response
 from chirp.middleware.auth_rate_limit import AuthRateLimitConfig, AuthRateLimitMiddleware
 from chirp.middleware.security_headers import SecurityHeadersConfig
 from chirp.middleware.sessions import get_session
@@ -21,6 +21,12 @@ from chirp.middleware.static import StaticFiles
 from chirp.templating.returns import Page
 
 from chirp_space.config import SpaceConfig
+from chirp_space.federation import (
+    ACTIVITY_JSON,
+    DocumentFetcher,
+    FederationError,
+    FederationService,
+)
 from chirp_space.models import Customization, Owner, SiteState
 from chirp_space.services import SpaceService
 from chirp_space.store import Store, store_from_url
@@ -42,11 +48,13 @@ def create_app(
     debug: bool = True,
     store: Store | None = None,
     space_config: SpaceConfig | None = None,
+    federation_fetcher: DocumentFetcher | None = None,
 ) -> App:
     config = space_config or SpaceConfig.from_env(debug=debug)
     database = store or store_from_url(config.database_url)
     database.migrate()
     service = SpaceService(database, config)
+    federation = FederationService(database, config, fetcher=federation_fetcher)
     app_config = AppConfig(
         template_dir=TEMPLATES,
         debug=debug,
@@ -100,6 +108,72 @@ def create_app(
     @app.route("/health", referenced=True)
     def health() -> Response:
         return Response("ok", headers=(("Content-Type", "text/plain; charset=utf-8"),))
+
+    @app.route("/.well-known/webfinger", referenced=True)
+    def webfinger(request: Request):
+        if not config.federation_enabled:
+            return Response("Not found", status=404)
+        try:
+            document = federation.webfinger(str(request.query.get("resource", "")))
+        except FederationError as exc:
+            return _federation_error(exc)
+        return _protocol_json(document, content_type="application/jrd+json")
+
+    @app.route("/ap/actor", referenced=True)
+    def actor(request: Request):
+        if not config.federation_enabled:
+            return Response("Not found", status=404)
+        if not _accepts_activity(request):
+            return _federation_error(
+                FederationError("accept", "ActivityPub response type is required.", status=406)
+            )
+        try:
+            return _protocol_json(federation.actor_document())
+        except FederationError as exc:
+            return _federation_error(exc)
+
+    @app.route("/ap/keys/{key_id}", referenced=True)
+    def federation_key(request: Request, key_id: str):
+        if not config.federation_enabled:
+            return Response("Not found", status=404)
+        if not _accepts_activity(request):
+            return _federation_error(
+                FederationError("accept", "ActivityPub response type is required.", status=406)
+            )
+        try:
+            return _protocol_json(federation.key_document(key_id))
+        except FederationError as exc:
+            return _federation_error(exc)
+
+    @app.route("/ap/outbox", referenced=True)
+    def outbox(request: Request):
+        return _collection_response(request, federation, config, "outbox")
+
+    @app.route("/ap/followers", referenced=True)
+    def followers(request: Request):
+        return _collection_response(request, federation, config, "followers")
+
+    @app.route("/ap/following", referenced=True)
+    def following(request: Request):
+        return _collection_response(request, federation, config, "following")
+
+    @app.route("/ap/inbox", methods=["POST"], referenced=True)
+    async def inbox(request: Request):
+        if not config.federation_enabled:
+            return Response("Not found", status=404)
+        body = await request.body()
+        try:
+            receipt = federation.receive_inbox(
+                method=request.method,
+                target=request.path,
+                headers=request.headers,
+                body=body,
+            )
+        except FederationError as exc:
+            return _federation_error(exc)
+        return _protocol_json(
+            {"status": receipt.status, "activityType": receipt.activity_type}, status=202
+        )
 
     @app.route("/", template="setup_pending.html")
     def home(request: Request):
@@ -457,3 +531,42 @@ def _allowed_hosts(config: SpaceConfig) -> tuple[str, ...]:
         if railway_host not in hosts:
             hosts.append(railway_host)
     return tuple(hosts)
+
+
+def _accepts_activity(request: Request) -> bool:
+    accept = str(request.headers.get("accept", ""))
+    return (
+        not accept or ACTIVITY_JSON in accept or "application/ld+json" in accept or "*/*" in accept
+    )
+
+
+def _protocol_json(
+    value: object, *, content_type: str = ACTIVITY_JSON, status: int = 200
+) -> JSONResponse:
+    return replace(
+        JSONResponse.from_value(value, status=status, headers={"Content-Type": content_type}),
+        content_type=content_type,
+    )
+
+
+def _federation_error(error: FederationError) -> JSONResponse:
+    return _protocol_json(
+        {"error": error.code, "message": str(error)},
+        content_type="application/problem+json",
+        status=error.status,
+    )
+
+
+def _collection_response(
+    request: Request, federation: FederationService, config: SpaceConfig, name: str
+):
+    if not config.federation_enabled:
+        return Response("Not found", status=404)
+    if not _accepts_activity(request):
+        return _federation_error(
+            FederationError("accept", "ActivityPub response type is required.", status=406)
+        )
+    try:
+        return _protocol_json(federation.collection(name))
+    except FederationError as exc:
+        return _federation_error(exc)
