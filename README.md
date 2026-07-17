@@ -32,6 +32,23 @@ signatures are accepted only once. Rotation is atomic and keeps retired public k
 Remote key fetching is HTTPS-only, address-pinned, redirect-revalidated, size-bounded, and rejects
 private, loopback, link-local, multicast, reserved, or otherwise non-global destinations.
 
+Outbound activities and per-inbox deliveries commit together as immutable database rows. Delivery
+runs outside web requests in batches of at most 16, preserves creation order per inbox, and retries
+after 1 minute, 5 minutes, 30 minutes, 2 hours, 12 hours, 24 hours, then daily through day 7.
+Retryable HTTP failures are `408`, `409`, `425`, `429`, and `5xx`; other `4xx` responses become
+visible dead letters. Valid `Retry-After` values are capped at 24 hours. Operators can inspect and
+act on the bounded queue without editing the database:
+
+```bash
+uv run chirp-space queue
+uv run chirp-space deliver --limit 16
+uv run chirp-space retry-delivery DELIVERY_ID
+uv run chirp-space discard-delivery DELIVERY_ID
+```
+
+The worker validates and pins every destination address immediately before the signed POST. A
+delivery never logs or stores plaintext signing keys, raw response bodies, or remote markup.
+
 ## Local development
 
 ```bash

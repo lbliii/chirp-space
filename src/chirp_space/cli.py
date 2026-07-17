@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import UTC, datetime
 
+from chirp_space.config import SpaceConfig
+from chirp_space.delivery import DeliveryService, DeliveryWorker, HTTPSDeliveryTransport
+from chirp_space.federation import FederationService
+from chirp_space.store import store_from_url
 from chirp_space.web import create_app
 
 
@@ -16,7 +21,44 @@ def main() -> None:
     serve.add_argument("--no-debug", action="store_true")
     subparsers.add_parser("migrate", help="Apply app-owned database migrations")
     subparsers.add_parser("check", help="Validate routes, templates, and configuration")
+    deliver = subparsers.add_parser(
+        "deliver", help="Run one bounded batch of due federation deliveries"
+    )
+    deliver.add_argument("--limit", type=int, default=16)
+    subparsers.add_parser("queue", help="Show bounded federation queue health")
+    retry = subparsers.add_parser("retry-delivery", help="Retry one dead delivery")
+    retry.add_argument("delivery_id")
+    discard = subparsers.add_parser("discard-delivery", help="Discard one queued delivery")
+    discard.add_argument("delivery_id")
     args = parser.parse_args()
+
+    if args.command in {"deliver", "queue", "retry-delivery", "discard-delivery"}:
+        config = SpaceConfig.from_env(debug=False)
+        store = store_from_url(config.database_url)
+        try:
+            store.migrate()
+            federation = FederationService(store, config)
+            delivery = DeliveryService(store, federation)
+            if args.command == "deliver":
+                outcomes = DeliveryWorker(store, federation, HTTPSDeliveryTransport()).run_once(
+                    limit=args.limit
+                )
+            elif args.command == "retry-delivery":
+                delivery.retry_dead_letter(args.delivery_id)
+                outcomes = ()
+            elif args.command == "discard-delivery":
+                delivery.discard(args.delivery_id)
+                outcomes = ()
+            else:
+                outcomes = ()
+            health = store.queue_health(now=datetime.now(UTC))
+            print(
+                f"processed={len(outcomes)} pending={health.pending} "
+                f"retrying={health.retrying} dead={health.dead}"
+            )
+        finally:
+            store.close()
+        return
 
     app = create_app(debug=not getattr(args, "no_debug", False))
     if args.command == "serve":

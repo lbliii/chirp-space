@@ -15,7 +15,7 @@ import socket
 import ssl
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime, parsedate_to_datetime
 from threading import RLock
@@ -84,7 +84,7 @@ class SafeFetcher:
         requester: Requester | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
-        self._resolver = resolver or _resolve_public_addresses
+        self._resolver = resolver or resolve_public_addresses
         self._requester = requester or _pinned_get
         self._now = now or (lambda: datetime.now(UTC))
         self._cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
@@ -323,15 +323,27 @@ class FederationService:
         receipt = InboxReceipt(
             signature_hash=signature_hash,
             activity_id=activity_id,
+            body_hash=hashlib.sha256(
+                json.dumps(
+                    activity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest(),
             activity_type=activity_type or "unknown",
             status=status,
             diagnostic=diagnostic,
             received_at=self._now(),
         )
-        if not self.store.record_inbox_receipt(receipt):
+        record_result = self.store.record_inbox_receipt(receipt)
+        if record_result == "duplicate":
+            return replace(receipt, status="duplicate", diagnostic="activity already applied")
+        if record_result == "conflict":
             raise FederationError(
-                "replay", "Inbox activity or signature was already processed.", status=409
+                "activity-conflict",
+                "Inbox activity ID was reused with different content.",
+                status=409,
             )
+        if record_result == "replay":
+            raise FederationError("replay", "Inbox signature was already processed.", status=409)
         return receipt
 
     def _verify_legacy(
@@ -522,8 +534,11 @@ def parse_json_object(body: bytes) -> dict[str, Any]:
             result[key] = value
         return result
 
+    def invalid_constant(value: str) -> None:
+        raise FederationError("json-number", f"JSON number {value} is not finite.")
+
     try:
-        value = json.loads(body, object_pairs_hook=unique_pairs)
+        value = json.loads(body, object_pairs_hook=unique_pairs, parse_constant=invalid_constant)
     except UnicodeDecodeError as exc:
         raise FederationError("json-encoding", "JSON must be valid UTF-8.") from exc
     except json.JSONDecodeError as exc:
@@ -586,7 +601,7 @@ def validate_public_address(value: str) -> None:
         )
 
 
-def _resolve_public_addresses(host: str, port: int) -> Sequence[str]:
+def resolve_public_addresses(host: str, port: int) -> Sequence[str]:
     try:
         records = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -631,6 +646,38 @@ def _pinned_get(url: str, address: str, port: int, timeout: float, limit: int) -
     except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
         raise FederationError(
             "remote-network", "Remote document fetch failed.", status=502
+        ) from exc
+    finally:
+        connection.close()
+
+
+def pinned_post_activity(
+    url: str,
+    address: str,
+    port: int,
+    headers: Mapping[str, str],
+    body: bytes,
+    timeout: float = 15.0,
+) -> FetchResponse:
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+    connection = _PinnedHTTPSConnection(host, address, port, timeout)
+    try:
+        connection.request("POST", target, body=body, headers=dict(headers))
+        response = connection.getresponse()
+        response_body = response.read(64 * 1024 + 1)
+        if len(response_body) > 64 * 1024:
+            raise FederationError(
+                "delivery-response-size", "Delivery response exceeds 64 KiB.", status=502
+            )
+        response_headers = {key.lower(): value for key, value in response.getheaders()}
+        return FetchResponse(response.status, response_headers, response_body)
+    except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+        raise FederationError(
+            "delivery-network", "Federation delivery failed.", status=502
         ) from exc
     finally:
         connection.close()
