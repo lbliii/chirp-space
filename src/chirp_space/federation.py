@@ -121,7 +121,12 @@ class SafeFetcher:
                     "remote-status", f"Remote document returned HTTP {response.status}.", status=502
                 )
             media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-            if media_type not in {ACTIVITY_JSON, "application/ld+json", "application/json"}:
+            if media_type not in {
+                ACTIVITY_JSON,
+                "application/ld+json",
+                "application/json",
+                "application/jrd+json",
+            }:
                 raise FederationError(
                     "remote-type", "Remote document is not ActivityPub JSON.", status=502
                 )
@@ -248,11 +253,21 @@ class FederationService:
         if name not in {"outbox", "followers", "following"}:
             raise FederationError("collection-not-found", "Collection not found.", status=404)
         origin = self._state().settings.canonical_origin
+        relationships = self.store.relationships()
+        total_items = 0
+        if name == "followers":
+            total_items = sum(
+                item.inbound_state == "follower" and not item.blocked for item in relationships
+            )
+        elif name == "following":
+            total_items = sum(
+                item.outbound_state == "following" and not item.blocked for item in relationships
+            )
         return {
             "@context": AS_CONTEXT,
             "id": f"{origin}/ap/{name}",
             "type": "OrderedCollection",
-            "totalItems": 0,
+            "totalItems": total_items,
             "orderedItems": [],
         }
 

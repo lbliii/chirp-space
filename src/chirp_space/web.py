@@ -21,13 +21,17 @@ from chirp.middleware.static import StaticFiles
 from chirp.templating.returns import Page
 
 from chirp_space.config import SpaceConfig
+from chirp_space.delivery import DeliveryService
 from chirp_space.federation import (
     ACTIVITY_JSON,
     DocumentFetcher,
     FederationError,
     FederationService,
+    SafeFetcher,
+    parse_json_object,
 )
 from chirp_space.models import Customization, Owner, SiteState
+from chirp_space.relationships import RelationshipService
 from chirp_space.services import SpaceService
 from chirp_space.store import Store, store_from_url
 
@@ -54,7 +58,10 @@ def create_app(
     database = store or store_from_url(config.database_url)
     database.migrate()
     service = SpaceService(database, config)
-    federation = FederationService(database, config, fetcher=federation_fetcher)
+    protocol_fetcher = federation_fetcher or SafeFetcher()
+    federation = FederationService(database, config, fetcher=protocol_fetcher)
+    delivery = DeliveryService(database, federation)
+    relationships = RelationshipService(database, delivery, protocol_fetcher)
     app_config = AppConfig(
         template_dir=TEMPLATES,
         debug=debug,
@@ -169,10 +176,22 @@ def create_app(
                 headers=request.headers,
                 body=body,
             )
+            transition = (
+                relationships.receive(parse_json_object(body))
+                if receipt.status in {"accepted", "duplicate"}
+                else receipt.diagnostic
+            )
         except FederationError as exc:
             return _federation_error(exc)
+        except (PermissionError, ValueError) as exc:
+            return _federation_error(FederationError("relationship", str(exc), status=422))
         return _protocol_json(
-            {"status": receipt.status, "activityType": receipt.activity_type}, status=202
+            {
+                "status": receipt.status,
+                "activityType": receipt.activity_type,
+                "transition": transition,
+            },
+            status=202,
         )
 
     @app.route("/", template="setup_pending.html")
@@ -361,6 +380,111 @@ def create_app(
         else:
             get_session()["space_message"] = "Accessible theme and module defaults restored."
         return Redirect("/owner/customize")
+
+    def connection_page(
+        request: Request,
+        *,
+        error: str | None = None,
+        audience_preview: object | None = None,
+    ) -> Page | Redirect:
+        if viewer(request) is None:
+            return Redirect("/login")
+        return render(
+            request,
+            "connections.html",
+            error=error,
+            message=get_session().pop("space_message", None),
+            relationships=database.relationships(),
+            circles=database.circles(),
+            blocked_domains=database.blocked_domains(),
+            audience_preview=audience_preview,
+        )
+
+    @app.route("/owner/connections", template="connections.html")
+    def connections_page(request: Request):
+        return connection_page(request)
+
+    @app.route("/owner/connections", methods=["POST"], template="connections.html")
+    async def connections_submit(request: Request):
+        if viewer(request) is None:
+            return Redirect("/login")
+        form = await request.form()
+        action = str(form.get("action", ""))
+        actor_id = str(form.get("actor_id", ""))
+        try:
+            if action == "discover":
+                relationship = relationships.discover(str(form.get("reference", "")))
+                message = f"Discovered {relationship.actor.display_name}. Review before following."
+            elif action == "follow":
+                relationships.send_follow(actor_id)
+                message = "Follow request queued."
+            elif action == "accept":
+                relationships.accept_follower(actor_id)
+                message = "Follower accepted; the Accept activity is queued."
+            elif action == "reject":
+                relationships.reject_follower(actor_id)
+                message = "Follow request rejected."
+            elif action == "unfollow":
+                relationships.unfollow(actor_id)
+                message = "Unfollow queued. The remote server may show stale state."
+            elif action == "remove":
+                relationships.remove_follower(actor_id)
+                message = "Follower removed from future restricted audiences."
+            elif action in {"pin", "unpin", "mute", "unmute"}:
+                preference = "pinned" if action in {"pin", "unpin"} else "muted"
+                relationships.set_preference(
+                    actor_id,
+                    preference=preference,
+                    enabled=action in {"pin", "mute"},
+                )
+                message = f"Local {preference} preference updated."
+            elif action == "note":
+                relationships.set_preference(
+                    actor_id,
+                    preference="note",
+                    enabled=True,
+                    note=str(form.get("note", "")),
+                )
+                message = "Private relationship note saved."
+            elif action == "block":
+                if str(form.get("confirm", "")) != "block":
+                    raise ValueError("Confirm that blocking does not erase remote copies.")
+                relationships.block_actor(actor_id)
+                message = "Actor blocked locally; relationships and queued delivery were removed."
+            elif action == "unblock":
+                relationships.unblock_actor(actor_id)
+                message = "Actor unblocked. No relationship was restored."
+            elif action == "block-domain":
+                if str(form.get("confirm", "")) != "block":
+                    raise ValueError("Confirm the domain-wide block.")
+                relationships.block_domain(str(form.get("domain", "")))
+                message = "Domain blocked locally."
+            elif action == "unblock-domain":
+                relationships.unblock_domain(str(form.get("domain", "")))
+                message = "Domain unblocked. No relationship was restored."
+            elif action == "create-circle":
+                relationships.create_circle(str(form.get("name", "")))
+                message = "Local-only circle created."
+            elif action == "circle-members":
+                member_ids = tuple(
+                    item.strip()
+                    for item in str(form.get("member_actor_ids", "")).splitlines()
+                    if item.strip()
+                )
+                relationships.set_circle_members(str(form.get("circle_id", "")), member_ids)
+                message = "Circle membership updated."
+            elif action == "audience-preview":
+                preview = relationships.audience_preview(
+                    str(form.get("visibility", "")),
+                    circle_id=str(form.get("circle_id", "")) or None,
+                )
+                return connection_page(request, audience_preview=preview)
+            else:
+                raise ValueError("Unknown connection action.")
+        except (FederationError, PermissionError, RuntimeError, ValueError) as exc:
+            return connection_page(request, error=str(exc))
+        get_session()["space_message"] = message
+        return Redirect("/owner/connections")
 
     return app
 

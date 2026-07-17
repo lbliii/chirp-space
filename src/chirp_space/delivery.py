@@ -152,7 +152,7 @@ class DeliveryWorker:
         self.federation = federation
         self.transport = transport
         self._now = now or (lambda: datetime.now(UTC))
-        self._is_blocked = is_blocked or (lambda _inbox: False)
+        self._is_blocked = is_blocked or self._store_blocks_inbox
 
     def run_once(self, *, limit: int = MAX_DELIVERIES_PER_RUN) -> tuple[Delivery, ...]:
         now = self._now()
@@ -205,6 +205,15 @@ class DeliveryWorker:
             self.store.update_delivery(outcome, circuit_open_until=circuit)
             outcomes.append(outcome)
         return tuple(outcomes)
+
+    def _store_blocks_inbox(self, inbox_url: str) -> bool:
+        domain = urlsplit(inbox_url).hostname
+        if domain is not None and self.store.is_blocked(domain=domain.casefold()):
+            return True
+        return any(
+            relationship.blocked and relationship.actor.inbox_url == inbox_url
+            for relationship in self.store.relationships()
+        )
 
     def _failure(
         self,

@@ -1,0 +1,122 @@
+{% extends "layout.html" %}
+{% block title %}Connections · {{ state.owner.display_name }}{% end %}
+{% block page_content %}
+<header class="page-heading">
+  <p class="eyebrow">Local relationship controls</p>
+  <h1>Connections and audiences</h1>
+  <p>Following and followers are asymmetric. “Friend” means both directions are currently accepted; circles, pins, mutes, and notes stay on this Space.</p>
+</header>
+{% if error %}<div class="notice error" role="alert" tabindex="-1">{{ error }}</div>{% end %}
+{% if message %}<div class="notice" role="status">{{ message }}</div>{% end %}
+
+<section class="form-card" aria-labelledby="discover-title">
+  <h2 id="discover-title">Discover a person</h2>
+  <form method="post" hx-target="#page-root" hx-swap="outerHTML show:top">
+    {{ csrf_field() }}<input type="hidden" name="action" value="discover">
+    <label>Actor URL or handle
+      <input name="reference" required placeholder="@person@example.social" autocomplete="off">
+    </label>
+    <button class="button primary" type="submit">Preview connection</button>
+  </form>
+</section>
+
+<section aria-labelledby="people-title">
+  <h2 id="people-title">People</h2>
+  {% if not relationships %}<p>No remote people have been discovered.</p>{% end %}
+  <div class="card-grid">
+  {% for relationship in relationships %}
+    <article class="card" aria-labelledby="person-{{ loop.index }}">
+      <h3 id="person-{{ loop.index }}">{{ relationship.actor.display_name }}</h3>
+      <p><code>@{{ relationship.actor.preferred_username }}@{{ relationship.actor.domain }}</code></p>
+      <p aria-label="Relationship state">
+        Outbound: <strong>{{ relationship.outbound_state }}</strong> ·
+        Inbound: <strong>{{ relationship.inbound_state }}</strong>
+        {% if relationship.friend %} · <strong>Friend</strong>{% end %}
+        {% if relationship.blocked %} · <strong>Blocked locally</strong>{% end %}
+        {% if relationship.muted %} · <strong>Muted locally</strong>{% end %}
+        {% if relationship.pinned %} · <strong>Pinned locally</strong>{% end %}
+        {% if relationship.unavailable %} · <strong>Unavailable</strong>{% end %}
+      </p>
+      {% if relationship.note %}<p><strong>Private note:</strong> {{ relationship.note }}</p>{% end %}
+      <div class="form-actions" aria-label="Actions for {{ relationship.actor.display_name }}">
+        {% if not relationship.blocked and relationship.outbound_state in ["none", "removed", "rejected"] %}<form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">{{ csrf_field() }}<input type="hidden" name="action" value="follow"><input type="hidden" name="actor_id" value="{{ relationship.actor.id }}"><button class="button" type="submit">Send Follow</button></form>{% end %}
+        {% if not relationship.blocked and relationship.inbound_state == "pending" %}<form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">{{ csrf_field() }}<input type="hidden" name="action" value="accept"><input type="hidden" name="actor_id" value="{{ relationship.actor.id }}"><button class="button" type="submit">Accept</button></form><form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">{{ csrf_field() }}<input type="hidden" name="action" value="reject"><input type="hidden" name="actor_id" value="{{ relationship.actor.id }}"><button class="button" type="submit">Reject</button></form>{% end %}
+        {% if relationship.outbound_state in ["pending", "following"] %}<form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">{{ csrf_field() }}<input type="hidden" name="action" value="unfollow"><input type="hidden" name="actor_id" value="{{ relationship.actor.id }}"><button class="button" type="submit">Unfollow</button></form>{% end %}
+        {% if relationship.inbound_state in ["pending", "follower"] %}<form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">{{ csrf_field() }}<input type="hidden" name="action" value="remove"><input type="hidden" name="actor_id" value="{{ relationship.actor.id }}"><button class="button" type="submit">Remove follower</button></form>{% end %}
+        {% if not relationship.blocked %}
+          <form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">{{ csrf_field() }}<input type="hidden" name="action" value="{% if relationship.pinned %}unpin{% else %}pin{% end %}"><input type="hidden" name="actor_id" value="{{ relationship.actor.id }}"><button class="button" type="submit">{% if relationship.pinned %}Unpin{% else %}Pin{% end %}</button></form>
+          <form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">{{ csrf_field() }}<input type="hidden" name="action" value="{% if relationship.muted %}unmute{% else %}mute{% end %}"><input type="hidden" name="actor_id" value="{{ relationship.actor.id }}"><button class="button" type="submit">{% if relationship.muted %}Unmute{% else %}Mute{% end %}</button></form>
+        {% endif %}
+      </div>
+      <form method="post" class="studio" hx-target="#page-root" hx-swap="outerHTML show:top">
+        {{ csrf_field() }}<input type="hidden" name="action" value="note"><input type="hidden" name="actor_id" value="{{ relationship.actor.id }}">
+        <label>Private note<textarea name="note" maxlength="500" rows="2">{{ relationship.note }}</textarea></label>
+        <button class="button" type="submit">Save note</button>
+      </form>
+      {% if relationship.blocked %}
+        <form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">{{ csrf_field() }}<input type="hidden" name="action" value="unblock"><input type="hidden" name="actor_id" value="{{ relationship.actor.id }}"><button class="button" type="submit">Unblock</button></form>
+      {% else %}
+      <form method="post" hx-target="#page-root" hx-swap="outerHTML show:top">
+        {{ csrf_field() }}<input type="hidden" name="action" value="block"><input type="hidden" name="actor_id" value="{{ relationship.actor.id }}">
+        <label><input type="checkbox" name="confirm" value="block" required> I understand blocking cannot erase remote copies.</label>
+        <button class="button danger" type="submit">Block actor</button>
+      </form>
+      {% endif %}
+    </article>
+  {% end %}
+  </div>
+</section>
+
+<section class="form-card" aria-labelledby="circle-title">
+  <h2 id="circle-title">Local-only circles</h2>
+  <form method="post" hx-target="#page-root" hx-swap="outerHTML show:top">
+    {{ csrf_field() }}<input type="hidden" name="action" value="create-circle">
+    <label>Circle name<input name="name" maxlength="60" required></label>
+    <button class="button" type="submit">Create circle</button>
+  </form>
+  {% for circle in circles %}
+  <form method="post" class="studio" hx-target="#page-root" hx-swap="outerHTML show:top">
+    {{ csrf_field() }}<input type="hidden" name="action" value="circle-members"><input type="hidden" name="circle_id" value="{{ circle.id }}">
+    <h3>{{ circle.name }}</h3>
+    <label>Exact friend actor IDs, one per line
+      <textarea name="member_actor_ids" rows="3">{% for actor_id in circle.member_actor_ids %}{{ actor_id }}{% if not loop.last %}
+{% endif %}{% end %}</textarea>
+    </label>
+    <button class="button" type="submit">Update circle members</button>
+  </form>
+  {% end %}
+</section>
+
+<section class="form-card" aria-labelledby="audience-title">
+  <h2 id="audience-title">Audience preview</h2>
+  <form method="post" hx-target="#page-root" hx-swap="outerHTML show:top">
+    {{ csrf_field() }}<input type="hidden" name="action" value="audience-preview">
+    <label>Visibility<select name="visibility">
+      <option value="public">Public</option><option value="unlisted">Unlisted</option>
+      <option value="followers">Followers</option><option value="friends">Friends</option>
+      <option value="circle">Circle</option><option value="local">Local only</option>
+      <option value="draft">Draft</option>
+    </select></label>
+    <label>Circle, when selected<select name="circle_id"><option value="">Choose a circle</option>{% for circle in circles %}<option value="{{ circle.id }}">{{ circle.name }}</option>{% end %}</select></label>
+    <button class="button primary" type="submit">Preview exact audience</button>
+  </form>
+  {% if audience_preview %}
+  <div class="notice" role="status">
+    <p><strong>{{ audience_preview.visibility }}</strong>: {{ audience_preview.disclosure }}</p>
+    {% if audience_preview.recipient_actor_ids %}<ul>{% for actor_id in audience_preview.recipient_actor_ids %}<li><code>{{ actor_id }}</code></li>{% end %}</ul>{% else %}<p>No remote recipients.</p>{% endif %}
+  </div>
+  {% endif %}
+</section>
+
+<section class="critical-card" aria-labelledby="domain-block-title">
+  <h2 id="domain-block-title">Domain block</h2>
+  <p>A domain block wins over actor preferences, removes relationships and circle membership, and cancels queued delivery. Unblocking restores nothing.</p>
+  <form method="post" hx-target="#page-root" hx-swap="outerHTML show:top">
+    {{ csrf_field() }}<input type="hidden" name="action" value="block-domain">
+    <label>Domain<input name="domain" required placeholder="example.social"></label>
+    <label><input type="checkbox" name="confirm" value="block" required> Apply this domain-wide local block.</label>
+    <button class="button danger" type="submit">Block domain</button>
+  </form>
+  {% if blocked_domains %}<h3>Blocked domains</h3><ul>{% for domain in blocked_domains %}<li><code>{{ domain }}</code><form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">{{ csrf_field() }}<input type="hidden" name="action" value="unblock-domain"><input type="hidden" name="domain" value="{{ domain }}"><button class="button" type="submit">Unblock without restoring relationships</button></form></li>{% end %}</ul>{% endif %}
+</section>
+{% end %}
