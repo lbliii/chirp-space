@@ -21,6 +21,7 @@ from chirp_space.federation import (
     validate_remote_url,
 )
 from chirp_space.models import Delivery, OutboundActivity, QueueHealth
+from chirp_space.safety import SafetyLimitError
 from chirp_space.store import Store
 
 RETRYABLE_STATUSES = frozenset({408, 409, 425, 429})
@@ -95,6 +96,8 @@ class DeliveryService:
     ) -> tuple[Delivery, ...]:
         if not self.federation.config.federation_enabled:
             raise RuntimeError("Federation is disabled for this Space.")
+        if self.federation.safety.control().outbound_paused:
+            raise RuntimeError("Federation delivery is paused; local publishing remains available.")
         activity_id = _https_identifier(activity.get("id"), "Activity ID")
         actor_id = _https_identifier(activity.get("actor"), "Activity actor")
         origin = self.federation.config.canonical_origin
@@ -114,6 +117,11 @@ class DeliveryService:
         object_id = _https_identifier(object_value, "Activity object") if object_value else None
         for inbox_url in inbox_urls:
             validate_remote_url(inbox_url)
+        if activity_type == "Follow" and object_id and inbox_urls:
+            try:
+                self.federation.safety.check_follow_budget(actor=object_id, inbox_url=inbox_urls[0])
+            except SafetyLimitError as exc:
+                raise RuntimeError(str(exc)) from exc
         outbound = OutboundActivity(
             id=activity_id,
             actor_id=actor_id,
@@ -156,6 +164,8 @@ class DeliveryWorker:
 
     def run_once(self, *, limit: int = MAX_DELIVERIES_PER_RUN) -> tuple[Delivery, ...]:
         now = self._now()
+        if self.federation.safety.control().outbound_paused:
+            return ()
         jobs = self.store.due_delivery_jobs(
             now=now, limit=min(max(0, limit), MAX_DELIVERIES_PER_RUN)
         )
@@ -173,35 +183,44 @@ class DeliveryWorker:
                 self.store.update_delivery(outcome)
                 outcomes.append(outcome)
                 continue
-            headers = self.federation.sign_request("POST", delivery.inbox_url, job.activity.body)
             try:
-                response = self.transport.send(
-                    delivery.inbox_url, headers=headers, body=job.activity.body
+                lease_id = self.federation.safety.begin_outbound(inbox_url=delivery.inbox_url)
+            except SafetyLimitError:
+                continue
+            try:
+                headers = self.federation.sign_request(
+                    "POST", delivery.inbox_url, job.activity.body
                 )
-            except FederationError as exc:
-                outcome, circuit = self._failure(
-                    delivery, now=now, error=exc.code, retry_after=None, retryable=True
-                )
-            else:
-                if 200 <= response.status < 300:
-                    outcome = replace(
-                        delivery,
-                        status="delivered",
-                        attempts=delivery.attempts + 1,
-                        next_attempt_at=now,
-                        last_error=None,
-                        updated_at=now,
+                try:
+                    response = self.transport.send(
+                        delivery.inbox_url, headers=headers, body=job.activity.body
                     )
-                    circuit = None
-                else:
-                    retryable = response.status in RETRYABLE_STATUSES or response.status >= 500
+                except FederationError as exc:
                     outcome, circuit = self._failure(
-                        delivery,
-                        now=now,
-                        error=f"HTTP {response.status}",
-                        retry_after=response.headers.get("retry-after"),
-                        retryable=retryable,
+                        delivery, now=now, error=exc.code, retry_after=None, retryable=True
                     )
+                else:
+                    if 200 <= response.status < 300:
+                        outcome = replace(
+                            delivery,
+                            status="delivered",
+                            attempts=delivery.attempts + 1,
+                            next_attempt_at=now,
+                            last_error=None,
+                            updated_at=now,
+                        )
+                        circuit = None
+                    else:
+                        retryable = response.status in RETRYABLE_STATUSES or response.status >= 500
+                        outcome, circuit = self._failure(
+                            delivery,
+                            now=now,
+                            error=f"HTTP {response.status}",
+                            retry_after=response.headers.get("retry-after"),
+                            retryable=retryable,
+                        )
+            finally:
+                self.federation.safety.release(lease_id)
             self.store.update_delivery(outcome, circuit_open_until=circuit)
             outcomes.append(outcome)
         return tuple(outcomes)

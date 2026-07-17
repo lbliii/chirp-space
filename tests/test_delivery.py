@@ -351,10 +351,13 @@ def test_https_transport_rejects_mixed_private_dns_before_post() -> None:
     assert called is False
 
 
+@pytest.mark.issue(799)
 def test_queue_cli_reports_health_without_database_surgery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'cli.db'}")
     monkeypatch.setattr(sys, "argv", ["chirp-space", "queue"])
     main()
-    assert capsys.readouterr().out == "processed=0 pending=0 retrying=0 dead=0\n"
+    output = capsys.readouterr().out
+    assert "processed=0 pending=0 retrying=0 dead=0" in output
+    assert "inbound_paused=False outbound_paused=False" in output

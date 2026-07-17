@@ -70,6 +70,20 @@ uv run chirp-space discard-delivery DELIVERY_ID
 The worker validates and pins every destination address immediately before the signed POST. A
 delivery never logs or stores plaintext signing keys, raw response bodies, or remote markup.
 
+## Federation safety and recovery
+
+The accepted federation budgets are database-backed so restarts, multiple workers, and
+free-threaded execution cannot create independent process-local allowances. Inbox requests are
+bounded globally and by pseudonymous client, domain, and actor tokens; delivery uses global,
+domain, and inbox leases. Follow creation has separate domain and actor budgets. All leases expire
+automatically after interrupted work.
+
+The owner can pause inbound, outbound, or all federation from `/owner/connections` without taking
+the local site or publishing offline. That page also shows queue health, per-peer failure state,
+dead letters, and recent bounded security decisions. Evidence export contains keyed tokens rather
+than raw client addresses or actor paths, and events expire after 30 days. Blocking and pausing do
+not delete local content, restore relationships, or claim to erase remote copies.
+
 ## Relationship and audience semantics
 
 Connections are asymmetric. `Following` means this owner received a matching Accept; `Follower`

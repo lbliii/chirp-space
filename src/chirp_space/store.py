@@ -11,12 +11,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from chirp_space.models import (
     Circle,
     ContentItem,
     Delivery,
     DeliveryJob,
+    FederationControl,
     FederationKey,
     GuestbookEntry,
     InboxReceipt,
@@ -24,10 +26,12 @@ from chirp_space.models import (
     MediaVariant,
     OutboundActivity,
     Owner,
+    PeerQueueStatus,
     ProfileModule,
     QueueHealth,
     Relationship,
     RemoteActor,
+    SecurityEvent,
     SiteSettings,
     SiteState,
     Theme,
@@ -235,6 +239,40 @@ CREATE TABLE IF NOT EXISTS guestbook_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_guestbook_abuse
     ON guestbook_entries(abuse_token, created_at);
+CREATE TABLE IF NOT EXISTS federation_controls (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    inbound_paused INTEGER NOT NULL CHECK (inbound_paused IN (0, 1)),
+    outbound_paused INTEGER NOT NULL CHECK (outbound_paused IN (0, 1)),
+    reason TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS federation_rate_buckets (
+    bucket_key TEXT PRIMARY KEY,
+    tokens REAL NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS federation_leases (
+    lease_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    principal TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(lease_id, scope, principal)
+);
+CREATE INDEX IF NOT EXISTS idx_federation_leases_active
+    ON federation_leases(scope, principal, expires_at);
+CREATE TABLE IF NOT EXISTS security_events (
+    id TEXT PRIMARY KEY,
+    surface TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    principal_token TEXT NOT NULL,
+    domain TEXT,
+    actor_token TEXT,
+    detail_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_security_events_retention ON security_events(created_at);
 """
 
 POSTGRES_MIGRATION = (
@@ -441,6 +479,41 @@ POSTGRES_MIGRATION = (
     )""",
     """CREATE INDEX IF NOT EXISTS idx_guestbook_abuse
         ON guestbook_entries(abuse_token, created_at)""",
+    """CREATE TABLE IF NOT EXISTS federation_controls (
+        singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
+        inbound_paused BOOLEAN NOT NULL,
+        outbound_paused BOOLEAN NOT NULL,
+        reason TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        updated_at TIMESTAMPTZ NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS federation_rate_buckets (
+        bucket_key TEXT PRIMARY KEY,
+        tokens DOUBLE PRECISION NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS federation_leases (
+        lease_id TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        principal TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY(lease_id, scope, principal)
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_federation_leases_active
+        ON federation_leases(scope, principal, expires_at)""",
+    """CREATE TABLE IF NOT EXISTS security_events (
+        id UUID PRIMARY KEY,
+        surface TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        principal_token TEXT NOT NULL,
+        domain TEXT,
+        actor_token TEXT,
+        detail_json TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_security_events_retention
+        ON security_events(created_at)""",
 )
 
 RELATIONSHIP_SELECT = """SELECT
@@ -542,6 +615,31 @@ class Store(Protocol):
     def moderate_guestbook(
         self, entry_id: str, *, status: str, moderated_at: datetime
     ) -> GuestbookEntry: ...
+    def federation_control(self) -> FederationControl: ...
+    def update_federation_control(
+        self, control: FederationControl, *, expected_revision: int
+    ) -> FederationControl: ...
+    def consume_rate_bucket(
+        self,
+        bucket_key: str,
+        *,
+        capacity: int,
+        refill_per_second: float,
+        now: datetime,
+    ) -> tuple[bool, int]: ...
+    def acquire_federation_lease(
+        self,
+        lease_id: str,
+        limits: Sequence[tuple[str, str, int]],
+        *,
+        now: datetime,
+        ttl: timedelta,
+    ) -> bool: ...
+    def release_federation_lease(self, lease_id: str) -> None: ...
+    def record_security_event(self, event: SecurityEvent) -> None: ...
+    def security_events(self, *, limit: int = 100) -> tuple[SecurityEvent, ...]: ...
+    def purge_security_events(self, *, before: datetime) -> int: ...
+    def peer_queue_statuses(self) -> tuple[PeerQueueStatus, ...]: ...
 
 
 class SQLiteStore:
@@ -588,6 +686,17 @@ class SQLiteStore:
             self._connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (5, ?, ?)",
                 ("personal publishing media tags and guestbook", _iso(datetime.now(UTC))),
+            )
+            now = datetime.now(UTC)
+            self._connection.execute(
+                """INSERT OR IGNORE INTO federation_controls(
+                    singleton_id, inbound_paused, outbound_paused, reason, revision, updated_at
+                ) VALUES (1, 0, 0, '', 1, ?)""",
+                (_iso(now),),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (6, ?, ?)",
+                ("federation safety controls limits and diagnostics", _iso(now)),
             )
 
     def close(self) -> None:
@@ -1391,6 +1500,158 @@ class SQLiteStore:
                 ).fetchone()
             )
 
+    def federation_control(self) -> FederationControl:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM federation_controls WHERE singleton_id = 1"
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Federation controls are not initialized.")
+        return _federation_control_from_mapping(row)
+
+    def update_federation_control(
+        self, control: FederationControl, *, expected_revision: int
+    ) -> FederationControl:
+        with self._lock:
+            updated = self._connection.execute(
+                """UPDATE federation_controls SET inbound_paused = ?, outbound_paused = ?,
+                reason = ?, revision = ?, updated_at = ?
+                WHERE singleton_id = 1 AND revision = ?""",
+                (
+                    control.inbound_paused,
+                    control.outbound_paused,
+                    control.reason,
+                    control.revision,
+                    _iso(control.updated_at),
+                    expected_revision,
+                ),
+            )
+        if updated.rowcount != 1:
+            raise RuntimeError("Federation controls changed in another session.")
+        return self.federation_control()
+
+    def consume_rate_bucket(
+        self,
+        bucket_key: str,
+        *,
+        capacity: int,
+        refill_per_second: float,
+        now: datetime,
+    ) -> tuple[bool, int]:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT tokens, updated_at FROM federation_rate_buckets WHERE bucket_key = ?",
+                    (bucket_key,),
+                ).fetchone()
+                tokens = float(capacity)
+                if row is not None:
+                    elapsed = max(0.0, (now - _datetime(row[1])).total_seconds())
+                    tokens = min(float(capacity), float(row[0]) + elapsed * refill_per_second)
+                allowed = tokens >= 1.0
+                remaining = tokens - 1.0 if allowed else tokens
+                self._connection.execute(
+                    """INSERT INTO federation_rate_buckets(bucket_key, tokens, updated_at)
+                    VALUES (?, ?, ?) ON CONFLICT(bucket_key) DO UPDATE SET
+                    tokens = excluded.tokens, updated_at = excluded.updated_at""",
+                    (bucket_key, remaining, _iso(now)),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        retry = 0 if allowed else max(1, int((1.0 - remaining) / refill_per_second) + 1)
+        return allowed, retry
+
+    def acquire_federation_lease(
+        self,
+        lease_id: str,
+        limits: Sequence[tuple[str, str, int]],
+        *,
+        now: datetime,
+        ttl: timedelta,
+    ) -> bool:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                self._connection.execute(
+                    "DELETE FROM federation_leases WHERE expires_at <= ?", (_iso(now),)
+                )
+                for scope, principal, limit in limits:
+                    count = self._connection.execute(
+                        """SELECT COUNT(*) FROM federation_leases
+                        WHERE scope = ? AND principal = ? AND expires_at > ?""",
+                        (scope, principal, _iso(now)),
+                    ).fetchone()
+                    if count is not None and int(count[0]) >= limit:
+                        self._connection.execute("COMMIT")
+                        return False
+                self._connection.executemany(
+                    """INSERT INTO federation_leases(
+                        lease_id, scope, principal, expires_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?)""",
+                    [
+                        (lease_id, scope, principal, _iso(now + ttl), _iso(now))
+                        for scope, principal, _limit in limits
+                    ],
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return True
+
+    def release_federation_lease(self, lease_id: str) -> None:
+        with self._lock:
+            self._connection.execute(
+                "DELETE FROM federation_leases WHERE lease_id = ?", (lease_id,)
+            )
+
+    def record_security_event(self, event: SecurityEvent) -> None:
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO security_events(
+                    id, surface, decision, principal_token, domain,
+                    actor_token, detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event.id,
+                    event.surface,
+                    event.decision,
+                    event.principal_token,
+                    event.domain,
+                    event.actor_token,
+                    json.dumps(event.detail, sort_keys=True),
+                    _iso(event.created_at),
+                ),
+            )
+
+    def security_events(self, *, limit: int = 100) -> tuple[SecurityEvent, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM security_events ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(limit, 500)),),
+            ).fetchall()
+        return tuple(_security_event_from_mapping(row) for row in rows)
+
+    def purge_security_events(self, *, before: datetime) -> int:
+        with self._lock:
+            deleted = self._connection.execute(
+                "DELETE FROM security_events WHERE created_at < ?", (_iso(before),)
+            )
+        return deleted.rowcount
+
+    def peer_queue_statuses(self) -> tuple[PeerQueueStatus, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT inbox_url, status, last_error FROM deliveries"
+            ).fetchall()
+            circuits = self._connection.execute(
+                "SELECT inbox_url, circuit_open_until FROM delivery_peers"
+            ).fetchall()
+        return _peer_queue_statuses(rows, circuits)
+
     def save_media(self, asset: MediaAsset) -> None:
         with self._lock:
             try:
@@ -1744,6 +2005,17 @@ class PostgresStore:
                 """INSERT INTO schema_migrations(version, name) VALUES (5, %s)
                 ON CONFLICT (version) DO NOTHING""",
                 ("personal publishing media tags and guestbook",),
+            )
+            connection.execute(
+                """INSERT INTO federation_controls(
+                    singleton_id, inbound_paused, outbound_paused, reason, revision, updated_at
+                ) VALUES (1, FALSE, FALSE, '', 1, now())
+                ON CONFLICT (singleton_id) DO NOTHING"""
+            )
+            connection.execute(
+                """INSERT INTO schema_migrations(version, name) VALUES (6, %s)
+                ON CONFLICT (version) DO NOTHING""",
+                ("federation safety controls limits and diagnostics",),
             )
 
     def close(self) -> None:
@@ -2435,6 +2707,151 @@ class PostgresStore:
                 ).fetchone()
             )
 
+    def federation_control(self) -> FederationControl:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """SELECT inbound_paused, outbound_paused, reason, revision, updated_at
+                FROM federation_controls WHERE singleton_id = 1"""
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Federation controls are not initialized.")
+        return _federation_control_from_sequence(row)
+
+    def update_federation_control(
+        self, control: FederationControl, *, expected_revision: int
+    ) -> FederationControl:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """UPDATE federation_controls SET inbound_paused = %s,
+                outbound_paused = %s, reason = %s, revision = %s, updated_at = %s
+                WHERE singleton_id = 1 AND revision = %s RETURNING singleton_id""",
+                (
+                    control.inbound_paused,
+                    control.outbound_paused,
+                    control.reason,
+                    control.revision,
+                    control.updated_at,
+                    expected_revision,
+                ),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Federation controls changed in another session.")
+        return self.federation_control()
+
+    def consume_rate_bucket(
+        self,
+        bucket_key: str,
+        *,
+        capacity: int,
+        refill_per_second: float,
+        now: datetime,
+    ) -> tuple[bool, int]:
+        with self._pool.connection() as connection, connection.transaction():
+            connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (bucket_key,))
+            row = connection.execute(
+                """SELECT tokens, updated_at FROM federation_rate_buckets
+                WHERE bucket_key = %s FOR UPDATE""",
+                (bucket_key,),
+            ).fetchone()
+            tokens = float(capacity)
+            if row is not None:
+                elapsed = max(0.0, (now - _datetime(row[1])).total_seconds())
+                tokens = min(float(capacity), float(row[0]) + elapsed * refill_per_second)
+            allowed = tokens >= 1.0
+            remaining = tokens - 1.0 if allowed else tokens
+            connection.execute(
+                """INSERT INTO federation_rate_buckets(bucket_key, tokens, updated_at)
+                VALUES (%s, %s, %s) ON CONFLICT(bucket_key) DO UPDATE SET
+                tokens = excluded.tokens, updated_at = excluded.updated_at""",
+                (bucket_key, remaining, now),
+            )
+        retry = 0 if allowed else max(1, int((1.0 - remaining) / refill_per_second) + 1)
+        return allowed, retry
+
+    def acquire_federation_lease(
+        self,
+        lease_id: str,
+        limits: Sequence[tuple[str, str, int]],
+        *,
+        now: datetime,
+        ttl: timedelta,
+    ) -> bool:
+        ordered = tuple(sorted(limits))
+        with self._pool.connection() as connection, connection.transaction():
+            for scope, principal, _limit in ordered:
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))", (f"{scope}:{principal}",)
+                )
+            connection.execute("DELETE FROM federation_leases WHERE expires_at <= %s", (now,))
+            for scope, principal, limit in ordered:
+                row = connection.execute(
+                    """SELECT COUNT(*) FROM federation_leases
+                    WHERE scope = %s AND principal = %s AND expires_at > %s""",
+                    (scope, principal, now),
+                ).fetchone()
+                if row is not None and int(row[0]) >= limit:
+                    return False
+            connection.cursor().executemany(
+                """INSERT INTO federation_leases(
+                    lease_id, scope, principal, expires_at, created_at
+                ) VALUES (%s, %s, %s, %s, %s)""",
+                [
+                    (lease_id, scope, principal, now + ttl, now)
+                    for scope, principal, _limit in ordered
+                ],
+            )
+        return True
+
+    def release_federation_lease(self, lease_id: str) -> None:
+        with self._pool.connection() as connection:
+            connection.execute("DELETE FROM federation_leases WHERE lease_id = %s", (lease_id,))
+
+    def record_security_event(self, event: SecurityEvent) -> None:
+        with self._pool.connection() as connection:
+            connection.execute(
+                """INSERT INTO security_events(
+                    id, surface, decision, principal_token, domain,
+                    actor_token, detail_json, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    event.id,
+                    event.surface,
+                    event.decision,
+                    event.principal_token,
+                    event.domain,
+                    event.actor_token,
+                    json.dumps(event.detail, sort_keys=True),
+                    event.created_at,
+                ),
+            )
+
+    def security_events(self, *, limit: int = 100) -> tuple[SecurityEvent, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT id, surface, decision, principal_token, domain,
+                actor_token, detail_json, created_at FROM security_events
+                ORDER BY created_at DESC LIMIT %s""",
+                (max(1, min(limit, 500)),),
+            ).fetchall()
+        return tuple(_security_event_from_sequence(row) for row in rows)
+
+    def purge_security_events(self, *, before: datetime) -> int:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "DELETE FROM security_events WHERE created_at < %s RETURNING id", (before,)
+            ).fetchall()
+        return len(row)
+
+    def peer_queue_statuses(self) -> tuple[PeerQueueStatus, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                "SELECT inbox_url, status, last_error FROM deliveries"
+            ).fetchall()
+            circuits = connection.execute(
+                "SELECT inbox_url, circuit_open_until FROM delivery_peers"
+            ).fetchall()
+        return _peer_queue_statuses(rows, circuits)
+
     def save_media(self, asset: MediaAsset) -> None:
         with self._pool.connection() as connection, connection.transaction():
             connection.execute(
@@ -2951,6 +3368,102 @@ def _queue_health(counts: dict[str, int], circuits: int) -> QueueHealth:
         dead=counts.get("dead", 0),
         discarded=counts.get("discarded", 0),
         open_circuits=circuits,
+    )
+
+
+def _federation_control_from_mapping(row: sqlite3.Row) -> FederationControl:
+    return FederationControl(
+        inbound_paused=bool(row["inbound_paused"]),
+        outbound_paused=bool(row["outbound_paused"]),
+        reason=str(row["reason"]),
+        revision=int(row["revision"]),
+        updated_at=_datetime(row["updated_at"]),
+    )
+
+
+def _federation_control_from_sequence(row: Sequence[object]) -> FederationControl:
+    return FederationControl(
+        inbound_paused=bool(row[0]),
+        outbound_paused=bool(row[1]),
+        reason=str(row[2]),
+        revision=int(str(row[3])),
+        updated_at=_datetime(row[4]),
+    )
+
+
+def _security_event_values(raw: object) -> dict[str, int | str]:
+    value = json.loads(str(raw))
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if isinstance(item, int | str) and not isinstance(item, bool)
+    }
+
+
+def _security_event_from_mapping(row: sqlite3.Row) -> SecurityEvent:
+    return SecurityEvent(
+        id=str(row["id"]),
+        surface=str(row["surface"]),
+        decision=str(row["decision"]),
+        principal_token=str(row["principal_token"]),
+        domain=str(row["domain"]) if row["domain"] else None,
+        actor_token=str(row["actor_token"]) if row["actor_token"] else None,
+        detail=_security_event_values(row["detail_json"]),
+        created_at=_datetime(row["created_at"]),
+    )
+
+
+def _security_event_from_sequence(row: Sequence[object]) -> SecurityEvent:
+    return SecurityEvent(
+        id=str(row[0]),
+        surface=str(row[1]),
+        decision=str(row[2]),
+        principal_token=str(row[3]),
+        domain=str(row[4]) if row[4] else None,
+        actor_token=str(row[5]) if row[5] else None,
+        detail=_security_event_values(row[6]),
+        created_at=_datetime(row[7]),
+    )
+
+
+def _peer_queue_statuses(
+    rows: Sequence[Sequence[object]], circuits: Sequence[Sequence[object]]
+) -> tuple[PeerQueueStatus, ...]:
+    state: dict[str, dict[str, int | str | None]] = {}
+    for row in rows:
+        domain = (urlsplit(str(row[0])).hostname or "invalid-destination").casefold()
+        values = state.setdefault(
+            domain,
+            {"pending": 0, "retrying": 0, "dead": 0, "delivered": 0, "circuits": 0, "error": None},
+        )
+        status = str(row[1])
+        if status in {"pending", "retrying", "dead", "delivered"}:
+            values[status] = int(values[status] or 0) + 1
+        if row[2]:
+            values["error"] = str(row[2])[:200]
+    now = datetime.now(UTC)
+    for row in circuits:
+        if row[1] is None or _datetime(row[1]) <= now:
+            continue
+        domain = (urlsplit(str(row[0])).hostname or "invalid-destination").casefold()
+        values = state.setdefault(
+            domain,
+            {"pending": 0, "retrying": 0, "dead": 0, "delivered": 0, "circuits": 0, "error": None},
+        )
+        values["circuits"] = int(values["circuits"] or 0) + 1
+    return tuple(
+        PeerQueueStatus(
+            domain=domain,
+            pending=int(values["pending"] or 0),
+            retrying=int(values["retrying"] or 0),
+            dead=int(values["dead"] or 0),
+            delivered=int(values["delivered"] or 0),
+            open_circuits=int(values["circuits"] or 0),
+            last_error=str(values["error"]) if values["error"] else None,
+        )
+        for domain, values in sorted(state.items())
     )
 
 

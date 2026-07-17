@@ -119,4 +119,26 @@
   </form>
   {% if blocked_domains %}<h3>Blocked domains</h3><ul>{% for domain in blocked_domains %}<li><code>{{ domain }}</code><form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">{{ csrf_field() }}<input type="hidden" name="action" value="unblock-domain"><input type="hidden" name="domain" value="{{ domain }}"><button class="button" type="submit">Unblock without restoring relationships</button></form></li>{% end %}</ul>{% endif %}
 </section>
+
+<section class="critical-card" aria-labelledby="federation-safety-title">
+  <h2 id="federation-safety-title">Federation safety and recovery</h2>
+  <p>The local site and publishing stay available while either federation direction is paused.</p>
+  <p><strong>Inbound:</strong> {% if federation_control.inbound_paused %}paused{% else %}running{% endif %} · <strong>Outbound:</strong> {% if federation_control.outbound_paused %}paused{% else %}running{% endif %}{% if federation_control.reason %} · {{ federation_control.reason }}{% endif %}</p>
+  <p>Queue: {{ queue_health.pending }} pending, {{ queue_health.retrying }} retrying, {{ queue_health.dead }} dead letters, {{ queue_health.open_circuits }} open circuits.</p>
+  <form method="post" class="studio" hx-target="#page-root" hx-swap="outerHTML show:top">
+    {{ csrf_field() }}<input type="hidden" name="revision" value="{{ federation_control.revision }}">
+    <label>Operator reason<input name="reason" maxlength="200" value="{{ federation_control.reason }}"></label>
+    <div class="form-actions">
+      <button class="button" name="action" value="{% if federation_control.inbound_paused %}resume-inbound{% else %}pause-inbound{% endif %}" type="submit">{% if federation_control.inbound_paused %}Resume{% else %}Pause{% endif %} inbound</button>
+      <button class="button" name="action" value="{% if federation_control.outbound_paused %}resume-outbound{% else %}pause-outbound{% endif %}" type="submit">{% if federation_control.outbound_paused %}Resume{% else %}Pause{% endif %} outbound</button>
+      <button class="button danger" name="action" value="pause-all" type="submit">Emergency pause all federation</button>
+      {% if federation_control.inbound_paused or federation_control.outbound_paused %}<button class="button" name="action" value="resume-all" type="submit">Resume all federation</button>{% endif %}
+    </div>
+  </form>
+  <h3>Peer queue status</h3>
+  {% if peer_statuses %}<div class="table-scroll"><table><thead><tr><th>Peer</th><th>Pending</th><th>Retrying</th><th>Dead</th><th>Delivered</th><th>Circuits</th><th>Last bounded error</th></tr></thead><tbody>{% for peer in peer_statuses %}<tr><th><code>{{ peer.domain }}</code></th><td>{{ peer.pending }}</td><td>{{ peer.retrying }}</td><td>{{ peer.dead }}</td><td>{{ peer.delivered }}</td><td>{{ peer.open_circuits }}</td><td>{{ peer.last_error or "—" }}</td></tr>{% end %}</tbody></table></div>{% else %}<p>No federation delivery history.</p>{% endif %}
+  <h3>Recent security decisions</h3>
+  {% if security_events %}<ul>{% for event in security_events %}<li><time datetime="{{ event.created_at.isoformat() }}">{{ event.created_at.strftime("%Y-%m-%d %H:%M UTC") }}</time> · {{ event.surface }} · {{ event.decision }}{% if event.domain %} · <code>{{ event.domain }}</code>{% endif %}</li>{% end %}</ul>{% else %}<p>No retained security decisions.</p>{% endif %}
+  <p><a class="button" href="/owner/federation/events">Export bounded evidence (JSON)</a></p>
+</section>
 {% end %}

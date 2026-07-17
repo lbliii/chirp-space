@@ -285,6 +285,7 @@ def create_app(
                 target=request.path,
                 headers=request.headers,
                 body=body,
+                client_key=request.client[0] if request.client else "unknown-client",
             )
             transition = (
                 relationships.receive(parse_json_object(body))
@@ -826,6 +827,10 @@ def create_app(
             circles=database.circles(),
             blocked_domains=database.blocked_domains(),
             audience_preview=audience_preview,
+            federation_control=federation.safety.control(),
+            queue_health=delivery.health(),
+            peer_statuses=database.peer_queue_statuses(),
+            security_events=database.security_events(limit=25),
         )
 
     @app.route("/owner/connections", template="connections.html")
@@ -907,12 +912,69 @@ def create_app(
                     circle_id=str(form.get("circle_id", "")) or None,
                 )
                 return connection_page(request, audience_preview=preview)
+            elif action in {
+                "pause-inbound",
+                "resume-inbound",
+                "pause-outbound",
+                "resume-outbound",
+                "pause-all",
+                "resume-all",
+            }:
+                control = federation.safety.control()
+                inbound = control.inbound_paused
+                outbound = control.outbound_paused
+                if action in {"pause-inbound", "pause-all"}:
+                    inbound = True
+                if action in {"resume-inbound", "resume-all"}:
+                    inbound = False
+                if action in {"pause-outbound", "pause-all"}:
+                    outbound = True
+                if action in {"resume-outbound", "resume-all"}:
+                    outbound = False
+                federation.safety.update_control(
+                    expected_revision=int(str(form.get("revision", "0"))),
+                    inbound_paused=inbound,
+                    outbound_paused=outbound,
+                    reason=str(form.get("reason", "")),
+                )
+                message = "Federation emergency controls updated; the local site remains online."
+            elif action == "retry-delivery":
+                delivery.retry_dead_letter(str(form.get("delivery_id", "")))
+                message = "Dead-letter delivery safely queued for one fresh retry cycle."
+            elif action == "discard-delivery":
+                delivery.discard(str(form.get("delivery_id", "")))
+                message = "Delivery discarded without changing local content."
             else:
                 raise ValueError("Unknown connection action.")
         except (FederationError, PermissionError, RuntimeError, ValueError) as exc:
             return connection_page(request, error=str(exc))
         get_session()["space_message"] = message
         return Redirect("/owner/connections")
+
+    @app.route("/owner/federation/events", referenced=True)
+    def federation_events(request: Request):
+        if viewer(request) is None:
+            return Response("Not found", status=404)
+        events = database.security_events(limit=500)
+        return JSONResponse.from_value(
+            {
+                "retentionDays": 30,
+                "events": [
+                    {
+                        "id": event.id,
+                        "surface": event.surface,
+                        "decision": event.decision,
+                        "principalToken": event.principal_token,
+                        "domain": event.domain,
+                        "actorToken": event.actor_token,
+                        "detail": event.detail,
+                        "createdAt": event.created_at.isoformat(),
+                    }
+                    for event in events
+                ],
+            },
+            headers={"Content-Disposition": 'attachment; filename="federation-events.json"'},
+        )
 
     return app
 
