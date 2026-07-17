@@ -144,3 +144,48 @@ class QueueHealth:
     dead: int
     discarded: int
     open_circuits: int
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteActor:
+    id: str
+    inbox_url: str
+    preferred_username: str
+    display_name: str
+    domain: str
+    last_contact_at: datetime
+    deleted_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Relationship:
+    actor: RemoteActor
+    outbound_state: str
+    inbound_state: str
+    outbound_follow_id: str | None
+    inbound_follow_id: str | None
+    pinned: bool
+    muted: bool
+    blocked: bool
+    unavailable: bool
+    note: str
+    updated_at: datetime
+
+    @property
+    def friend(self) -> bool:
+        return self.outbound_state == "following" and self.inbound_state == "follower"
+
+
+@dataclass(frozen=True, slots=True)
+class Circle:
+    id: str
+    name: str
+    member_actor_ids: tuple[str, ...]
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AudiencePreview:
+    visibility: str
+    recipient_actor_ids: tuple[str, ...]
+    disclosure: str

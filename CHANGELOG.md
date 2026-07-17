@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add the issue #796 asymmetric relationship state machines, safe actor/WebFinger discovery,
+  Follow/Accept/Reject/Undo flows, derived friends, local circles/pins/mutes/notes, actor and domain
+  blocks, exact audience previews, and shared plain-request/htmx owner controls.
 - Add the issue #794 durable federation delivery spine: immutable activity and per-inbox delivery
   rows, ordered bounded workers, the accepted retry/dead-letter schedule, persistent peer circuits,
   SSRF-safe signed POSTs, restart proof, and operator queue/retry/discard commands.

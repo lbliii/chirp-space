@@ -49,6 +49,19 @@ uv run chirp-space discard-delivery DELIVERY_ID
 The worker validates and pins every destination address immediately before the signed POST. A
 delivery never logs or stores plaintext signing keys, raw response bodies, or remote markup.
 
+## Relationship and audience semantics
+
+Connections are asymmetric. `Following` means this owner received a matching Accept; `Follower`
+means this owner accepted a remote Follow; `Friend` is only the derived display state when both are
+active. Circles, pins, mutes, and private notes are local preferences and are never federated.
+
+The owner page at `/owner/connections` supports URL or WebFinger discovery, explicit follow
+accept/reject/remove flows, local circles, mute/pin, actor and domain blocks, and exact audience
+previews with ordinary forms or htmx. Blocking is enforced before discovery and delivery, removes
+circle eligibility, cancels queued work, and restores no relationship when undone. Followers,
+friends, and circles are access-control intentions—not encryption, DRM, or remote revocation—and
+the preview names exact recipients before restricted publication.
+
 ## Local development
 
 ```bash

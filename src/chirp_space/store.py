@@ -13,6 +13,7 @@ from threading import RLock
 from typing import Protocol
 
 from chirp_space.models import (
+    Circle,
     Delivery,
     DeliveryJob,
     FederationKey,
@@ -21,6 +22,8 @@ from chirp_space.models import (
     Owner,
     ProfileModule,
     QueueHealth,
+    Relationship,
+    RemoteActor,
     SiteSettings,
     SiteState,
     Theme,
@@ -126,6 +129,46 @@ CREATE TABLE IF NOT EXISTS delivery_peers (
     circuit_open_until TEXT,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS remote_actors (
+    id TEXT PRIMARY KEY,
+    inbox_url TEXT NOT NULL,
+    preferred_username TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    last_contact_at TEXT NOT NULL,
+    deleted_at TEXT
+);
+CREATE TABLE IF NOT EXISTS relationships (
+    actor_id TEXT PRIMARY KEY REFERENCES remote_actors(id) ON DELETE CASCADE,
+    outbound_state TEXT NOT NULL CHECK (
+        outbound_state IN ('none', 'pending', 'following', 'rejected', 'removed', 'remote-deleted', 'unavailable')
+    ),
+    inbound_state TEXT NOT NULL CHECK (
+        inbound_state IN ('none', 'pending', 'follower', 'rejected', 'removed')
+    ),
+    outbound_follow_id TEXT,
+    inbound_follow_id TEXT,
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    muted INTEGER NOT NULL DEFAULT 0 CHECK (muted IN (0, 1)),
+    blocked INTEGER NOT NULL DEFAULT 0 CHECK (blocked IN (0, 1)),
+    unavailable INTEGER NOT NULL DEFAULT 0 CHECK (unavailable IN (0, 1)),
+    note TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS circles (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS circle_members (
+    circle_id TEXT NOT NULL REFERENCES circles(id) ON DELETE CASCADE,
+    actor_id TEXT NOT NULL REFERENCES relationships(actor_id) ON DELETE CASCADE,
+    PRIMARY KEY(circle_id, actor_id)
+);
+CREATE TABLE IF NOT EXISTS domain_blocks (
+    domain TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
 """
 
 POSTGRES_MIGRATION = (
@@ -228,7 +271,59 @@ POSTGRES_MIGRATION = (
         circuit_open_until TIMESTAMPTZ,
         updated_at TIMESTAMPTZ NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS remote_actors (
+        id TEXT PRIMARY KEY,
+        inbox_url TEXT NOT NULL,
+        preferred_username TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        last_contact_at TIMESTAMPTZ NOT NULL,
+        deleted_at TIMESTAMPTZ
+    )""",
+    """CREATE TABLE IF NOT EXISTS relationships (
+        actor_id TEXT PRIMARY KEY REFERENCES remote_actors(id) ON DELETE CASCADE,
+        outbound_state TEXT NOT NULL CHECK (
+            outbound_state IN (
+                'none', 'pending', 'following', 'rejected', 'removed', 'remote-deleted', 'unavailable'
+            )
+        ),
+        inbound_state TEXT NOT NULL CHECK (
+            inbound_state IN ('none', 'pending', 'follower', 'rejected', 'removed')
+        ),
+        outbound_follow_id TEXT,
+        inbound_follow_id TEXT,
+        pinned BOOLEAN NOT NULL DEFAULT FALSE,
+        muted BOOLEAN NOT NULL DEFAULT FALSE,
+        blocked BOOLEAN NOT NULL DEFAULT FALSE,
+        unavailable BOOLEAN NOT NULL DEFAULT FALSE,
+        note TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS circles (
+        id UUID PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS circle_members (
+        circle_id UUID NOT NULL REFERENCES circles(id) ON DELETE CASCADE,
+        actor_id TEXT NOT NULL REFERENCES relationships(actor_id) ON DELETE CASCADE,
+        PRIMARY KEY(circle_id, actor_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS domain_blocks (
+        domain TEXT PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL
+    )""",
 )
+
+RELATIONSHIP_SELECT = """SELECT
+    a.id, a.inbox_url, a.preferred_username, a.display_name, a.domain,
+    a.last_contact_at, a.deleted_at, r.outbound_state, r.inbound_state,
+    r.outbound_follow_id, r.inbound_follow_id,
+    r.pinned, r.muted,
+    (r.blocked OR EXISTS(SELECT 1 FROM domain_blocks b WHERE b.domain = a.domain))
+        AS effective_blocked,
+    r.unavailable, r.note, r.updated_at
+FROM relationships r JOIN remote_actors a ON a.id = r.actor_id"""
 
 
 def token_hash(value: str) -> str:
@@ -278,6 +373,19 @@ class Store(Protocol):
     def retry_delivery(self, delivery_id: str, *, now: datetime) -> bool: ...
     def discard_delivery(self, delivery_id: str, *, now: datetime) -> bool: ...
     def queue_health(self, *, now: datetime) -> QueueHealth: ...
+    def upsert_remote_actor(self, actor: RemoteActor) -> Relationship: ...
+    def relationship(self, actor_id: str) -> Relationship | None: ...
+    def relationships(self) -> tuple[Relationship, ...]: ...
+    def save_relationship(self, relationship: Relationship) -> Relationship: ...
+    def create_circle(self, circle: Circle) -> Circle: ...
+    def circles(self) -> tuple[Circle, ...]: ...
+    def set_circle_members(self, circle_id: str, actor_ids: Sequence[str]) -> Circle: ...
+    def block_actor(self, actor_id: str, *, now: datetime) -> Relationship: ...
+    def unblock_actor(self, actor_id: str, *, now: datetime) -> Relationship: ...
+    def block_domain(self, domain: str, *, now: datetime) -> None: ...
+    def unblock_domain(self, domain: str) -> None: ...
+    def blocked_domains(self) -> tuple[str, ...]: ...
+    def is_blocked(self, actor_id: str | None = None, domain: str | None = None) -> bool: ...
 
 
 class SQLiteStore:
@@ -316,6 +424,10 @@ class SQLiteStore:
             self._connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (3, ?, ?)",
                 ("durable federation activities and deliveries", _iso(datetime.now(UTC))),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (4, ?, ?)",
+                ("asymmetric relationships and local circles", _iso(datetime.now(UTC))),
             )
 
     def close(self) -> None:
@@ -857,6 +969,268 @@ class SQLiteStore:
             )
         return _queue_health(counts, circuits)
 
+    def upsert_remote_actor(self, actor: RemoteActor) -> Relationship:
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO remote_actors(
+                    id, inbox_url, preferred_username, display_name, domain,
+                    last_contact_at, deleted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    inbox_url = excluded.inbox_url,
+                    preferred_username = excluded.preferred_username,
+                    display_name = excluded.display_name,
+                    domain = excluded.domain,
+                    last_contact_at = excluded.last_contact_at,
+                    deleted_at = excluded.deleted_at""",
+                (
+                    actor.id,
+                    actor.inbox_url,
+                    actor.preferred_username,
+                    actor.display_name,
+                    actor.domain,
+                    _iso(actor.last_contact_at),
+                    _iso(actor.deleted_at) if actor.deleted_at else None,
+                ),
+            )
+            self._connection.execute(
+                """INSERT OR IGNORE INTO relationships(
+                    actor_id, outbound_state, inbound_state, updated_at
+                ) VALUES (?, 'none', 'none', ?)""",
+                (actor.id, _iso(actor.last_contact_at)),
+            )
+        result = self.relationship(actor.id)
+        if result is None:
+            raise RuntimeError("Remote actor persistence did not create a relationship.")
+        return result
+
+    def relationship(self, actor_id: str) -> Relationship | None:
+        with self._lock:
+            row = self._connection.execute(
+                f"{RELATIONSHIP_SELECT} WHERE a.id = ?", (actor_id,)
+            ).fetchone()
+        return _relationship_from_mapping(row) if row is not None else None
+
+    def relationships(self) -> tuple[Relationship, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                f"{RELATIONSHIP_SELECT} ORDER BY r.pinned DESC, a.display_name, a.id"
+            ).fetchall()
+        return tuple(_relationship_from_mapping(row) for row in rows)
+
+    def save_relationship(self, relationship: Relationship) -> Relationship:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                updated = self._connection.execute(
+                    """UPDATE relationships SET outbound_state = ?, inbound_state = ?,
+                    outbound_follow_id = ?, inbound_follow_id = ?, pinned = ?, muted = ?,
+                    blocked = ?, unavailable = ?, note = ?, updated_at = ? WHERE actor_id = ?""",
+                    (
+                        relationship.outbound_state,
+                        relationship.inbound_state,
+                        relationship.outbound_follow_id,
+                        relationship.inbound_follow_id,
+                        relationship.pinned,
+                        relationship.muted,
+                        relationship.blocked,
+                        relationship.unavailable,
+                        relationship.note,
+                        _iso(relationship.updated_at),
+                        relationship.actor.id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("Remote relationship does not exist.")
+                if not relationship.friend or relationship.blocked:
+                    self._connection.execute(
+                        "DELETE FROM circle_members WHERE actor_id = ?",
+                        (relationship.actor.id,),
+                    )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        result = self.relationship(relationship.actor.id)
+        if result is None:
+            raise RuntimeError("Remote relationship disappeared after update.")
+        return result
+
+    def create_circle(self, circle: Circle) -> Circle:
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO circles(id, name, created_at) VALUES (?, ?, ?)",
+                (circle.id, circle.name, _iso(circle.created_at)),
+            )
+        return circle
+
+    def circles(self) -> tuple[Circle, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT c.id, c.name, c.created_at, m.actor_id
+                FROM circles c LEFT JOIN circle_members m ON m.circle_id = c.id
+                ORDER BY c.name, m.actor_id"""
+            ).fetchall()
+        return _circles_from_rows(rows)
+
+    def set_circle_members(self, circle_id: str, actor_ids: Sequence[str]) -> Circle:
+        members = tuple(dict.fromkeys(actor_ids))
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                circle_row = self._connection.execute(
+                    "SELECT id, name, created_at FROM circles WHERE id = ?", (circle_id,)
+                ).fetchone()
+                if circle_row is None:
+                    raise RuntimeError("Circle does not exist.")
+                if members:
+                    eligible = {
+                        str(row[0])
+                        for row in self._connection.execute(
+                            """SELECT r.actor_id FROM relationships r
+                            JOIN remote_actors a ON a.id = r.actor_id
+                            WHERE r.outbound_state = 'following'
+                              AND r.inbound_state = 'follower'
+                              AND r.blocked = 0
+                              AND NOT EXISTS(
+                                SELECT 1 FROM domain_blocks b WHERE b.domain = a.domain
+                              )"""
+                        )
+                    }
+                    if not set(members).issubset(eligible):
+                        raise ValueError("Circle members must be current unblocked friends.")
+                self._connection.execute(
+                    "DELETE FROM circle_members WHERE circle_id = ?", (circle_id,)
+                )
+                self._connection.executemany(
+                    "INSERT INTO circle_members(circle_id, actor_id) VALUES (?, ?)",
+                    [(circle_id, actor_id) for actor_id in members],
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return Circle(
+            id=str(circle_row["id"]),
+            name=str(circle_row["name"]),
+            member_actor_ids=tuple(sorted(members)),
+            created_at=_datetime(circle_row["created_at"]),
+        )
+
+    def block_actor(self, actor_id: str, *, now: datetime) -> Relationship:
+        self._apply_actor_block(actor_id, now=now, blocked=True)
+        result = self.relationship(actor_id)
+        if result is None:
+            raise RuntimeError("Remote relationship does not exist.")
+        return result
+
+    def unblock_actor(self, actor_id: str, *, now: datetime) -> Relationship:
+        self._apply_actor_block(actor_id, now=now, blocked=False)
+        result = self.relationship(actor_id)
+        if result is None:
+            raise RuntimeError("Remote relationship does not exist.")
+        return result
+
+    def _apply_actor_block(self, actor_id: str, *, now: datetime, blocked: bool) -> None:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                updated = self._connection.execute(
+                    """UPDATE relationships SET outbound_state = 'removed',
+                    inbound_state = 'removed', outbound_follow_id = NULL,
+                    inbound_follow_id = NULL, pinned = 0, muted = 0, blocked = ?,
+                    updated_at = ? WHERE actor_id = ?""",
+                    (blocked, _iso(now), actor_id),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("Remote relationship does not exist.")
+                self._connection.execute(
+                    "DELETE FROM circle_members WHERE actor_id = ?", (actor_id,)
+                )
+                self._connection.execute(
+                    """UPDATE deliveries SET status = 'discarded',
+                    last_error = 'cancelled by block', updated_at = ?
+                    WHERE inbox_url = (SELECT inbox_url FROM remote_actors WHERE id = ?)
+                      AND status IN ('pending', 'retrying')""",
+                    (_iso(now), actor_id),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    def block_domain(self, domain: str, *, now: datetime) -> None:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO domain_blocks(domain, created_at) VALUES (?, ?)",
+                    (domain, _iso(now)),
+                )
+                actor_ids = tuple(
+                    str(row[0])
+                    for row in self._connection.execute(
+                        "SELECT id FROM remote_actors WHERE domain = ?", (domain,)
+                    )
+                )
+                for actor_id in actor_ids:
+                    self._connection.execute(
+                        """UPDATE relationships SET outbound_state = 'removed',
+                        inbound_state = 'removed', outbound_follow_id = NULL,
+                        inbound_follow_id = NULL, pinned = 0, muted = 0, updated_at = ?
+                        WHERE actor_id = ?""",
+                        (_iso(now), actor_id),
+                    )
+                    self._connection.execute(
+                        "DELETE FROM circle_members WHERE actor_id = ?", (actor_id,)
+                    )
+                self._connection.execute(
+                    """UPDATE deliveries SET status = 'discarded',
+                    last_error = 'cancelled by domain block', updated_at = ?
+                    WHERE inbox_url IN (SELECT inbox_url FROM remote_actors WHERE domain = ?)
+                      AND status IN ('pending', 'retrying')""",
+                    (_iso(now), domain),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    def unblock_domain(self, domain: str) -> None:
+        with self._lock:
+            self._connection.execute("DELETE FROM domain_blocks WHERE domain = ?", (domain,))
+
+    def blocked_domains(self) -> tuple[str, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT domain FROM domain_blocks ORDER BY domain"
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def is_blocked(self, actor_id: str | None = None, domain: str | None = None) -> bool:
+        with self._lock:
+            if (
+                domain is not None
+                and self._connection.execute(
+                    "SELECT 1 FROM domain_blocks WHERE domain = ?", (domain,)
+                ).fetchone()
+            ):
+                return True
+            if actor_id is None:
+                return False
+            row = self._connection.execute(
+                """SELECT r.blocked, a.domain FROM relationships r
+                JOIN remote_actors a ON a.id = r.actor_id WHERE r.actor_id = ?""",
+                (actor_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            return bool(row[0]) or bool(
+                self._connection.execute(
+                    "SELECT 1 FROM domain_blocks WHERE domain = ?", (str(row[1]),)
+                ).fetchone()
+            )
+
 
 class PostgresStore:
     """Production PostgreSQL adapter with transactional single-owner setup."""
@@ -894,6 +1268,11 @@ class PostgresStore:
                 """INSERT INTO schema_migrations(version, name) VALUES (3, %s)
                 ON CONFLICT (version) DO NOTHING""",
                 ("durable federation activities and deliveries",),
+            )
+            connection.execute(
+                """INSERT INTO schema_migrations(version, name) VALUES (4, %s)
+                ON CONFLICT (version) DO NOTHING""",
+                ("asymmetric relationships and local circles",),
             )
 
     def close(self) -> None:
@@ -1352,6 +1731,239 @@ class PostgresStore:
             circuits = int(circuit_row[0]) if circuit_row is not None else 0
         return _queue_health(counts, circuits)
 
+    def upsert_remote_actor(self, actor: RemoteActor) -> Relationship:
+        with self._pool.connection() as connection, connection.transaction():
+            connection.execute(
+                """INSERT INTO remote_actors(
+                    id, inbox_url, preferred_username, display_name, domain,
+                    last_contact_at, deleted_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(id) DO UPDATE SET
+                    inbox_url = excluded.inbox_url,
+                    preferred_username = excluded.preferred_username,
+                    display_name = excluded.display_name,
+                    domain = excluded.domain,
+                    last_contact_at = excluded.last_contact_at,
+                    deleted_at = excluded.deleted_at""",
+                (
+                    actor.id,
+                    actor.inbox_url,
+                    actor.preferred_username,
+                    actor.display_name,
+                    actor.domain,
+                    actor.last_contact_at,
+                    actor.deleted_at,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO relationships(
+                    actor_id, outbound_state, inbound_state, updated_at
+                ) VALUES (%s, 'none', 'none', %s)
+                ON CONFLICT(actor_id) DO NOTHING""",
+                (actor.id, actor.last_contact_at),
+            )
+        result = self.relationship(actor.id)
+        if result is None:
+            raise RuntimeError("Remote actor persistence did not create a relationship.")
+        return result
+
+    def relationship(self, actor_id: str) -> Relationship | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                f"{RELATIONSHIP_SELECT} WHERE a.id = %s", (actor_id,)
+            ).fetchone()
+        return _relationship_from_sequence(row) if row is not None else None
+
+    def relationships(self) -> tuple[Relationship, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                f"{RELATIONSHIP_SELECT} ORDER BY r.pinned DESC, a.display_name, a.id"
+            ).fetchall()
+        return tuple(_relationship_from_sequence(row) for row in rows)
+
+    def save_relationship(self, relationship: Relationship) -> Relationship:
+        with self._pool.connection() as connection, connection.transaction():
+            row = connection.execute(
+                """UPDATE relationships SET outbound_state = %s, inbound_state = %s,
+                outbound_follow_id = %s, inbound_follow_id = %s, pinned = %s, muted = %s,
+                blocked = %s, unavailable = %s, note = %s, updated_at = %s
+                WHERE actor_id = %s RETURNING actor_id""",
+                (
+                    relationship.outbound_state,
+                    relationship.inbound_state,
+                    relationship.outbound_follow_id,
+                    relationship.inbound_follow_id,
+                    relationship.pinned,
+                    relationship.muted,
+                    relationship.blocked,
+                    relationship.unavailable,
+                    relationship.note,
+                    relationship.updated_at,
+                    relationship.actor.id,
+                ),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Remote relationship does not exist.")
+            if not relationship.friend or relationship.blocked:
+                connection.execute(
+                    "DELETE FROM circle_members WHERE actor_id = %s",
+                    (relationship.actor.id,),
+                )
+        result = self.relationship(relationship.actor.id)
+        if result is None:
+            raise RuntimeError("Remote relationship disappeared after update.")
+        return result
+
+    def create_circle(self, circle: Circle) -> Circle:
+        with self._pool.connection() as connection:
+            connection.execute(
+                "INSERT INTO circles(id, name, created_at) VALUES (%s, %s, %s)",
+                (circle.id, circle.name, circle.created_at),
+            )
+        return circle
+
+    def circles(self) -> tuple[Circle, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT c.id, c.name, c.created_at, m.actor_id
+                FROM circles c LEFT JOIN circle_members m ON m.circle_id = c.id
+                ORDER BY c.name, m.actor_id"""
+            ).fetchall()
+        return _circles_from_rows(rows)
+
+    def set_circle_members(self, circle_id: str, actor_ids: Sequence[str]) -> Circle:
+        members = tuple(dict.fromkeys(actor_ids))
+        with self._pool.connection() as connection, connection.transaction():
+            circle_row = connection.execute(
+                "SELECT id, name, created_at FROM circles WHERE id = %s FOR UPDATE", (circle_id,)
+            ).fetchone()
+            if circle_row is None:
+                raise RuntimeError("Circle does not exist.")
+            if members:
+                eligible = {
+                    str(row[0])
+                    for row in connection.execute(
+                        """SELECT r.actor_id FROM relationships r
+                        JOIN remote_actors a ON a.id = r.actor_id
+                        WHERE r.actor_id = ANY(%s)
+                          AND r.outbound_state = 'following'
+                          AND r.inbound_state = 'follower'
+                          AND r.blocked = FALSE
+                          AND NOT EXISTS(
+                            SELECT 1 FROM domain_blocks b WHERE b.domain = a.domain
+                          )""",
+                        (list(members),),
+                    ).fetchall()
+                }
+                if eligible != set(members):
+                    raise ValueError("Circle members must be current unblocked friends.")
+            connection.execute("DELETE FROM circle_members WHERE circle_id = %s", (circle_id,))
+            connection.cursor().executemany(
+                "INSERT INTO circle_members(circle_id, actor_id) VALUES (%s, %s)",
+                [(circle_id, actor_id) for actor_id in members],
+            )
+        return Circle(
+            id=str(circle_row[0]),
+            name=str(circle_row[1]),
+            member_actor_ids=tuple(sorted(members)),
+            created_at=_datetime(circle_row[2]),
+        )
+
+    def block_actor(self, actor_id: str, *, now: datetime) -> Relationship:
+        self._apply_actor_block(actor_id, now=now, blocked=True)
+        result = self.relationship(actor_id)
+        if result is None:
+            raise RuntimeError("Remote relationship does not exist.")
+        return result
+
+    def unblock_actor(self, actor_id: str, *, now: datetime) -> Relationship:
+        self._apply_actor_block(actor_id, now=now, blocked=False)
+        result = self.relationship(actor_id)
+        if result is None:
+            raise RuntimeError("Remote relationship does not exist.")
+        return result
+
+    def _apply_actor_block(self, actor_id: str, *, now: datetime, blocked: bool) -> None:
+        with self._pool.connection() as connection, connection.transaction():
+            row = connection.execute(
+                """UPDATE relationships SET outbound_state = 'removed',
+                inbound_state = 'removed', outbound_follow_id = NULL,
+                inbound_follow_id = NULL, pinned = FALSE, muted = FALSE,
+                blocked = %s, updated_at = %s WHERE actor_id = %s RETURNING actor_id""",
+                (blocked, now, actor_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Remote relationship does not exist.")
+            connection.execute("DELETE FROM circle_members WHERE actor_id = %s", (actor_id,))
+            connection.execute(
+                """UPDATE deliveries SET status = 'discarded',
+                last_error = 'cancelled by block', updated_at = %s
+                WHERE inbox_url = (SELECT inbox_url FROM remote_actors WHERE id = %s)
+                  AND status IN ('pending', 'retrying')""",
+                (now, actor_id),
+            )
+
+    def block_domain(self, domain: str, *, now: datetime) -> None:
+        with self._pool.connection() as connection, connection.transaction():
+            connection.execute(
+                """INSERT INTO domain_blocks(domain, created_at) VALUES (%s, %s)
+                ON CONFLICT(domain) DO NOTHING""",
+                (domain, now),
+            )
+            connection.execute(
+                """DELETE FROM circle_members WHERE actor_id IN (
+                    SELECT id FROM remote_actors WHERE domain = %s
+                )""",
+                (domain,),
+            )
+            connection.execute(
+                """UPDATE relationships SET outbound_state = 'removed',
+                inbound_state = 'removed', outbound_follow_id = NULL,
+                inbound_follow_id = NULL, pinned = FALSE, muted = FALSE, updated_at = %s
+                WHERE actor_id IN (SELECT id FROM remote_actors WHERE domain = %s)""",
+                (now, domain),
+            )
+            connection.execute(
+                """UPDATE deliveries SET status = 'discarded',
+                last_error = 'cancelled by domain block', updated_at = %s
+                WHERE inbox_url IN (SELECT inbox_url FROM remote_actors WHERE domain = %s)
+                  AND status IN ('pending', 'retrying')""",
+                (now, domain),
+            )
+
+    def unblock_domain(self, domain: str) -> None:
+        with self._pool.connection() as connection:
+            connection.execute("DELETE FROM domain_blocks WHERE domain = %s", (domain,))
+
+    def blocked_domains(self) -> tuple[str, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute("SELECT domain FROM domain_blocks ORDER BY domain").fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def is_blocked(self, actor_id: str | None = None, domain: str | None = None) -> bool:
+        with self._pool.connection() as connection:
+            if (
+                domain is not None
+                and connection.execute(
+                    "SELECT 1 FROM domain_blocks WHERE domain = %s", (domain,)
+                ).fetchone()
+            ):
+                return True
+            if actor_id is None:
+                return False
+            row = connection.execute(
+                """SELECT r.blocked, a.domain FROM relationships r
+                JOIN remote_actors a ON a.id = r.actor_id WHERE r.actor_id = %s""",
+                (actor_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            return bool(row[0]) or bool(
+                connection.execute(
+                    "SELECT 1 FROM domain_blocks WHERE domain = %s", (str(row[1]),)
+                ).fetchone()
+            )
+
 
 def store_from_url(database_url: str) -> Store:
     if database_url.startswith("sqlite:///"):
@@ -1576,3 +2188,72 @@ def _bytes(value: object) -> bytes:
     if isinstance(value, (bytearray, memoryview)):
         return bytes(value)
     raise TypeError("Database binary value is not bytes-like.")
+
+
+def _relationship_from_mapping(row: sqlite3.Row) -> Relationship:
+    actor = RemoteActor(
+        id=str(row["id"]),
+        inbox_url=str(row["inbox_url"]),
+        preferred_username=str(row["preferred_username"]),
+        display_name=str(row["display_name"]),
+        domain=str(row["domain"]),
+        last_contact_at=_datetime(row["last_contact_at"]),
+        deleted_at=_datetime(row["deleted_at"]) if row["deleted_at"] else None,
+    )
+    return Relationship(
+        actor=actor,
+        outbound_state=str(row["outbound_state"]),
+        inbound_state=str(row["inbound_state"]),
+        outbound_follow_id=(str(row["outbound_follow_id"]) if row["outbound_follow_id"] else None),
+        inbound_follow_id=(str(row["inbound_follow_id"]) if row["inbound_follow_id"] else None),
+        pinned=bool(row["pinned"]),
+        muted=bool(row["muted"]),
+        blocked=bool(row["effective_blocked"]),
+        unavailable=bool(row["unavailable"]),
+        note=str(row["note"]),
+        updated_at=_datetime(row["updated_at"]),
+    )
+
+
+def _relationship_from_sequence(row: Sequence[object]) -> Relationship:
+    actor = RemoteActor(
+        id=str(row[0]),
+        inbox_url=str(row[1]),
+        preferred_username=str(row[2]),
+        display_name=str(row[3]),
+        domain=str(row[4]),
+        last_contact_at=_datetime(row[5]),
+        deleted_at=_datetime(row[6]) if row[6] else None,
+    )
+    return Relationship(
+        actor=actor,
+        outbound_state=str(row[7]),
+        inbound_state=str(row[8]),
+        outbound_follow_id=str(row[9]) if row[9] else None,
+        inbound_follow_id=str(row[10]) if row[10] else None,
+        pinned=bool(row[11]),
+        muted=bool(row[12]),
+        blocked=bool(row[13]),
+        unavailable=bool(row[14]),
+        note=str(row[15]),
+        updated_at=_datetime(row[16]),
+    )
+
+
+def _circles_from_rows(rows: Sequence[Sequence[object]]) -> tuple[Circle, ...]:
+    grouped: dict[str, tuple[str, datetime, list[str]]] = {}
+    for row in rows:
+        circle_id = str(row[0])
+        if circle_id not in grouped:
+            grouped[circle_id] = (str(row[1]), _datetime(row[2]), [])
+        if row[3] is not None:
+            grouped[circle_id][2].append(str(row[3]))
+    return tuple(
+        Circle(
+            id=circle_id,
+            name=name,
+            member_actor_ids=tuple(members),
+            created_at=created_at,
+        )
+        for circle_id, (name, created_at, members) in grouped.items()
+    )
