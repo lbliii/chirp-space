@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add issue #799 database-backed federation rate and concurrency budgets, emergency inbound and
+  outbound pause controls, per-peer queue diagnostics, bounded pseudonymous security evidence,
+  owner recovery controls, and 30-day event retention while local publishing remains available.
 - Add the issue #791 local publishing and guestbook surface: short posts, journals, normalized
   photos, links, drafts and lifecycle controls, stable archives and feeds, moderated anonymous
   entries, responsive Pillow media, storage-integrity checks, and shared plain-request/htmx flows.

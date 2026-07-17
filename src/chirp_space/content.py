@@ -600,13 +600,17 @@ class PublishingService:
         timestamp = item.published_at or item.updated_at
         payload = f"{timestamp.isoformat()}|{item.id}".encode()
         signature = hmac.new(self.config.secret_key.encode(), payload, hashlib.sha256).digest()
-        return base64.urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+        encoded_payload = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+        encoded_signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
+        return f"{encoded_payload}.{encoded_signature}"
 
     def _decode_cursor(self, cursor: str) -> tuple[datetime, str]:
         try:
-            padded = cursor + "=" * (-len(cursor) % 4)
-            value = base64.urlsafe_b64decode(padded)
-            payload, signature = value.rsplit(b".", 1)
+            encoded_payload, encoded_signature = cursor.split(".")
+            payload = base64.urlsafe_b64decode(encoded_payload + "=" * (-len(encoded_payload) % 4))
+            signature = base64.urlsafe_b64decode(
+                encoded_signature + "=" * (-len(encoded_signature) % 4)
+            )
             expected = hmac.new(self.config.secret_key.encode(), payload, hashlib.sha256).digest()
             if not hmac.compare_digest(signature, expected):
                 raise ValueError

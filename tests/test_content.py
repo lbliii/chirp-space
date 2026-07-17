@@ -117,6 +117,7 @@ def test_content_lifecycle_pagination_archive_search_and_tombstone(tmp_path: Pat
     page, cursor = service.list_public(limit=1)
     assert len(page) == 1
     assert cursor is not None
+    assert cursor.count(".") == 1
     older, _ = service.list_public(cursor=cursor, limit=1)
     assert older
     assert older[0].id != page[0].id

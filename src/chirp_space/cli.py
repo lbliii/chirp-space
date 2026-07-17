@@ -56,6 +56,18 @@ def main() -> None:
                 f"processed={len(outcomes)} pending={health.pending} "
                 f"retrying={health.retrying} dead={health.dead}"
             )
+            if args.command == "queue":
+                control = store.federation_control()
+                print(
+                    f"inbound_paused={control.inbound_paused} "
+                    f"outbound_paused={control.outbound_paused}"
+                )
+                for peer in store.peer_queue_statuses():
+                    print(
+                        f"peer={peer.domain} pending={peer.pending} retrying={peer.retrying} "
+                        f"dead={peer.dead} circuits={peer.open_circuits} "
+                        f"last_error={peer.last_error or '-'}"
+                    )
         finally:
             store.close()
         return

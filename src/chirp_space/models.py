@@ -147,6 +147,38 @@ class QueueHealth:
 
 
 @dataclass(frozen=True, slots=True)
+class FederationControl:
+    inbound_paused: bool
+    outbound_paused: bool
+    reason: str
+    revision: int
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SecurityEvent:
+    id: str
+    surface: str
+    decision: str
+    principal_token: str
+    domain: str | None
+    actor_token: str | None
+    detail: dict[str, int | str]
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PeerQueueStatus:
+    domain: str
+    pending: int
+    retrying: int
+    dead: int
+    delivered: int
+    open_circuits: int
+    last_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class RemoteActor:
     id: str
     inbox_url: str

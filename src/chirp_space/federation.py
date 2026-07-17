@@ -29,6 +29,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPubl
 
 from chirp_space.config import SpaceConfig
 from chirp_space.models import FederationKey, InboxReceipt, SiteState
+from chirp_space.safety import FederationSafety, SafetyLimitError
 from chirp_space.store import Store
 
 ACTIVITY_JSON = "application/activity+json"
@@ -155,6 +156,7 @@ class FederationService:
         self.fetcher = fetcher or SafeFetcher()
         self._now = now or (lambda: datetime.now(UTC))
         self._key_lock = RLock()
+        self.safety = FederationSafety(store, config.secret_key, now=self._now)
 
     def ensure_key(self) -> FederationKey:
         self._state()
@@ -312,6 +314,7 @@ class FederationService:
         target: str,
         headers: Mapping[str, str],
         body: bytes,
+        client_key: str = "unknown-client",
     ) -> InboxReceipt:
         if len(body) > MAX_DOCUMENT_BYTES:
             raise FederationError("body-size", "Inbox body exceeds 1 MiB.", status=413)
@@ -323,43 +326,59 @@ class FederationService:
         activity_id = _https_identifier(activity.get("id"), "Activity ID")
         activity_type = str(activity.get("type", ""))
         actor = _https_identifier(activity.get("actor"), "Activity actor")
-        if "signature-input" in lowered:
-            signature_hash = self._verify_rfc9421(
-                method=method, target=target, headers=lowered, body=body, actor=actor
+        domain = (urlsplit(actor).hostname or "unknown-actor").casefold()
+        try:
+            lease_id = self.safety.begin_inbound(client_key=client_key, actor=actor)
+        except SafetyLimitError as exc:
+            raise FederationError(exc.code, str(exc), status=exc.status) from exc
+        try:
+            try:
+                if "signature-input" in lowered:
+                    signature_hash = self._verify_rfc9421(
+                        method=method, target=target, headers=lowered, body=body, actor=actor
+                    )
+                else:
+                    signature_hash = self._verify_legacy(
+                        method=method, target=target, headers=lowered, body=body, actor=actor
+                    )
+            except FederationError as exc:
+                self.safety.record(
+                    "inbox", f"denied-{exc.code}", client_key, domain=domain, actor=actor
+                )
+                raise
+            status = "accepted" if activity_type in SUPPORTED_ACTIVITIES else "unsupported"
+            diagnostic = (
+                "validated for typed dispatch" if status == "accepted" else "activity type ignored"
             )
-        else:
-            signature_hash = self._verify_legacy(
-                method=method, target=target, headers=lowered, body=body, actor=actor
+            receipt = InboxReceipt(
+                signature_hash=signature_hash,
+                activity_id=activity_id,
+                body_hash=hashlib.sha256(
+                    json.dumps(
+                        activity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ).encode()
+                ).hexdigest(),
+                activity_type=activity_type or "unknown",
+                status=status,
+                diagnostic=diagnostic,
+                received_at=self._now(),
             )
-        status = "accepted" if activity_type in SUPPORTED_ACTIVITIES else "unsupported"
-        diagnostic = (
-            "validated for typed dispatch" if status == "accepted" else "activity type ignored"
-        )
-        receipt = InboxReceipt(
-            signature_hash=signature_hash,
-            activity_id=activity_id,
-            body_hash=hashlib.sha256(
-                json.dumps(
-                    activity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-                ).encode()
-            ).hexdigest(),
-            activity_type=activity_type or "unknown",
-            status=status,
-            diagnostic=diagnostic,
-            received_at=self._now(),
-        )
-        record_result = self.store.record_inbox_receipt(receipt)
-        if record_result == "duplicate":
-            return replace(receipt, status="duplicate", diagnostic="activity already applied")
-        if record_result == "conflict":
-            raise FederationError(
-                "activity-conflict",
-                "Inbox activity ID was reused with different content.",
-                status=409,
-            )
-        if record_result == "replay":
-            raise FederationError("replay", "Inbox signature was already processed.", status=409)
-        return receipt
+            record_result = self.store.record_inbox_receipt(receipt)
+            if record_result == "duplicate":
+                return replace(receipt, status="duplicate", diagnostic="activity already applied")
+            if record_result == "conflict":
+                raise FederationError(
+                    "activity-conflict",
+                    "Inbox activity ID was reused with different content.",
+                    status=409,
+                )
+            if record_result == "replay":
+                raise FederationError(
+                    "replay", "Inbox signature was already processed.", status=409
+                )
+            return receipt
+        finally:
+            self.safety.release(lease_id)
 
     def _verify_legacy(
         self,
