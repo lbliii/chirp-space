@@ -14,8 +14,24 @@ profile, and customize it through typed modules and constrained theme tokens.
 - Owner and site UUIDv7 identifiers survive display-name, handle, theme, and domain changes.
 - PostgreSQL is the production contract. SQLite supports local development and restart proof.
 
-Export, whole-site deletion, and Railway template publication remain deliberately gated by their
-Chirp backlog issues.
+## Ownership lifecycle
+
+Owners can export, restore, rotate signing keys, migrate the local canonical origin, and delete
+this Space from `/owner/lifecycle` (or the matching CLI commands). The export is a versioned ZIP
+envelope (`chirp-space-export` v1) with profile, settings, modules, content, media checksums,
+relationships, guestbook state, and **encrypted** federation private keys. Plaintext private keys
+are never exported. Restore validates envelope version and integrity, previews conflicts, and
+requires explicit confirmation. Fresh deployments restore with the owner claim token; claimed
+deployments require the owner password.
+
+Domain migration updates local `site_settings.canonical_origin` to match `SPACE_CANONICAL_ORIGIN`
+only. ActivityPub `Move` is outside federation contract v1, so migration with federation state
+requires acknowledging that actor IDs at the previous origin will not migrate and pauses inbound
+and outbound delivery. Permanent local deletion purges database rows and media objects after
+password confirmation. Remote Undo of outbound Follows is best-effort only; account-level Delete is
+not claimed, and remote servers may retain copies indefinitely.
+
+Railway template publication remains gated by its Chirp backlog issue.
 
 ## Publishing and guestbook
 
@@ -65,6 +81,9 @@ uv run chirp-space queue
 uv run chirp-space deliver --limit 16
 uv run chirp-space retry-delivery DELIVERY_ID
 uv run chirp-space discard-delivery DELIVERY_ID
+uv run chirp-space export ./space-backup.zip
+uv run chirp-space import-preview ./space-backup.zip
+uv run chirp-space import-restore ./space-backup.zip --confirmation 'REPLACE LOCAL SPACE' --claim-token "$SPACE_OWNER_CLAIM_TOKEN"
 ```
 
 The worker validates and pins every destination address immediately before the signed POST. A

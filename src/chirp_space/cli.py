@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
+from pathlib import Path
 
 from chirp_space.config import SpaceConfig
+from chirp_space.content import LocalObjectStorage
 from chirp_space.delivery import DeliveryService, DeliveryWorker, HTTPSDeliveryTransport
-from chirp_space.federation import FederationService
+from chirp_space.federation import FederationService, SafeFetcher
+from chirp_space.lifecycle import SpaceLifecycleService
+from chirp_space.relationships import RelationshipService
 from chirp_space.store import store_from_url
 from chirp_space.web import create_app
 
@@ -30,15 +34,70 @@ def main() -> None:
     retry.add_argument("delivery_id")
     discard = subparsers.add_parser("discard-delivery", help="Discard one queued delivery")
     discard.add_argument("delivery_id")
+    export_cmd = subparsers.add_parser("export", help="Write a versioned Space export archive")
+    export_cmd.add_argument("path", type=Path)
+    preview_cmd = subparsers.add_parser("import-preview", help="Preview a Space export archive")
+    preview_cmd.add_argument("path", type=Path)
+    import_cmd = subparsers.add_parser(
+        "import-restore", help="Restore a Space export archive (destructive)"
+    )
+    import_cmd.add_argument("path", type=Path)
+    import_cmd.add_argument("--confirmation", required=True)
+    import_cmd.add_argument("--password", default="")
+    import_cmd.add_argument("--claim-token", default="")
     args = parser.parse_args()
 
-    if args.command in {"deliver", "queue", "retry-delivery", "discard-delivery"}:
+    if args.command in {
+        "deliver",
+        "queue",
+        "retry-delivery",
+        "discard-delivery",
+        "export",
+        "import-preview",
+        "import-restore",
+    }:
         config = SpaceConfig.from_env(debug=False)
         store = store_from_url(config.database_url)
+        storage = LocalObjectStorage(Path.cwd() / ".chirp-space" / "media")
         try:
             store.migrate()
             federation = FederationService(store, config)
             delivery = DeliveryService(store, federation)
+            relationships = RelationshipService(store, delivery, SafeFetcher())
+            lifecycle = SpaceLifecycleService(
+                store,
+                config,
+                storage,
+                federation=federation,
+                relationships=relationships,
+            )
+            if args.command == "export":
+                args.path.write_bytes(lifecycle.export_archive())
+                print(f"wrote {args.path}")
+                return
+            if args.command == "import-preview":
+                preview = lifecycle.preview_import(args.path.read_bytes())
+                print(
+                    f"envelope={preview.envelope_version} handle={preview.handle} "
+                    f"content={preview.content_count} media={preview.media_count} "
+                    f"conflicts={len(preview.conflicts)}"
+                )
+                for item in preview.conflicts:
+                    print(f"conflict: {item}")
+                for item in preview.warnings:
+                    print(f"warning: {item}")
+                return
+            if args.command == "import-restore":
+                current = store.state()
+                preview = lifecycle.restore_archive(
+                    args.path.read_bytes(),
+                    confirmation=args.confirmation,
+                    owner=current.owner if current is not None else None,
+                    password=args.password,
+                    claim_token=args.claim_token,
+                )
+                print(f"restored handle={preview.handle} site_id={preview.site_id}")
+                return
             if args.command == "deliver":
                 outcomes = DeliveryWorker(store, federation, HTTPSDeliveryTransport()).run_once(
                     limit=args.limit

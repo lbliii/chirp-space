@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add issue #800 ownership lifecycle: versioned export/import envelope, transactional restore with
+  preview and fail-closed integrity checks, signing-key rotation confirmation, local canonical-origin
+  migration that refuses silent federation Move claims, permanent local deletion with honest remote
+  retention disclosure, owner lifecycle page, and export/import CLI commands.
 - Add issue #799 database-backed federation rate and concurrency budgets, emergency inbound and
   outbound pause controls, per-peer queue diagnostics, bounded pseudonymous security evidence,
   owner recovery controls, and 30-day event retention while local publishing remains available.
