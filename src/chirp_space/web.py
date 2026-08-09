@@ -42,6 +42,7 @@ from chirp_space.federation import (
     SafeFetcher,
     parse_json_object,
 )
+from chirp_space.feed import FeedService
 from chirp_space.media import PillowImageNormalizer
 from chirp_space.models import ContentItem, Customization, Owner, SiteState
 from chirp_space.relationships import RelationshipService
@@ -81,6 +82,7 @@ def create_app(
     federation = FederationService(database, config, fetcher=protocol_fetcher)
     delivery = DeliveryService(database, federation)
     relationships = RelationshipService(database, delivery, protocol_fetcher)
+    feed_service = FeedService(database, config, delivery)
     app_config = AppConfig(
         template_dir=TEMPLATES,
         debug=debug,
@@ -120,12 +122,15 @@ def create_app(
 
     def render(request: Request, template: str, **context: object) -> Page:
         state = database.state()
+        owner = viewer(request)
+        if "notification_count" not in context and owner is not None:
+            context = {**context, "notification_count": feed_service.unread_notification_count()}
         return Page(
             template,
             "page_content",
             page_block_name="page_root",
             state=state,
-            viewer=viewer(request),
+            viewer=owner,
             canonical_origin=config.canonical_origin,
             current_path=request.path,
             **context,
@@ -292,6 +297,11 @@ def create_app(
                 if receipt.status in {"accepted", "duplicate"}
                 else receipt.diagnostic
             )
+            feed_transition = (
+                feed_service.receive(parse_json_object(body))
+                if receipt.status in {"accepted", "duplicate"}
+                else receipt.diagnostic
+            )
         except FederationError as exc:
             return _federation_error(exc)
         except (PermissionError, ValueError) as exc:
@@ -301,6 +311,7 @@ def create_app(
                 "status": receipt.status,
                 "activityType": receipt.activity_type,
                 "transition": transition,
+                "feedTransition": feed_transition,
             },
             status=202,
         )
@@ -311,6 +322,156 @@ def create_app(
         if state is None:
             return render(request, "setup_pending.html")
         return render(request, "profile.html", profile=state, preview=False, **profile_context())
+
+    def feed_page(
+        request: Request,
+        *,
+        error: str | None = None,
+        message: str | None = None,
+    ) -> Page | Redirect | Response:
+        if viewer(request) is None:
+            return Redirect("/login")
+        cursor = str(request.query.get("cursor", "")).strip() or None
+        try:
+            entries, next_cursor = feed_service.home_feed(cursor=cursor)
+        except ValueError as exc:
+            return Response(str(exc), status=400)
+        return render(
+            request,
+            "feed.html",
+            error=error,
+            message=message or get_session().pop("space_message", None),
+            feed_entries=entries,
+            next_cursor=next_cursor,
+            notification_count=feed_service.unread_notification_count(),
+            notifications=feed_service.notifications(limit=8),
+        )
+
+    @app.route("/home", template="feed.html")
+    def owner_feed(request: Request):
+        return feed_page(request)
+
+    @app.route("/home", methods=["POST"], template="feed.html")
+    async def owner_feed_action(request: Request):
+        if viewer(request) is None:
+            return Redirect("/login")
+        form = await request.form()
+        action = str(form.get("action", ""))
+        object_id = str(form.get("object_id", "")).strip()
+        try:
+            if action == "like":
+                feed_service.like(object_id)
+                message = "Liked."
+            elif action == "unlike":
+                feed_service.unlike(object_id)
+                message = "Like removed."
+            elif action == "repost":
+                feed_service.repost(object_id)
+                message = "Reposted to your followers."
+            elif action == "unrepost":
+                feed_service.unrepost(object_id)
+                message = "Repost removed."
+            elif action == "bookmark":
+                feed_service.bookmark(object_id)
+                message = "Bookmarked privately on this Space."
+            elif action == "unbookmark":
+                feed_service.unbookmark(object_id)
+                message = "Bookmark removed."
+            elif action == "reply":
+                feed_service.reply(
+                    object_id,
+                    source=str(form.get("source", "")),
+                    visibility=str(form.get("visibility", "public")),
+                )
+                message = "Reply published."
+            elif action == "mark-unavailable":
+                feed_service.mark_unavailable(object_id, unavailable=True)
+                message = "Marked as unavailable stale cache."
+            else:
+                raise ValueError("Unknown feed action.")
+        except (PermissionError, ValueError, LookupError) as exc:
+            return feed_page(request, error=str(exc))
+        if request.headers.get("HX-Request"):
+            return feed_page(request, message=message)
+        get_session()["space_message"] = message
+        return Redirect("/home")
+
+    @app.route("/notifications", template="notifications.html")
+    def notifications_page(request: Request):
+        if viewer(request) is None:
+            return Redirect("/login")
+        return render(
+            request,
+            "notifications.html",
+            error=None,
+            notifications=feed_service.notifications(limit=100),
+            notification_count=feed_service.unread_notification_count(),
+            message=get_session().pop("space_message", None),
+        )
+
+    @app.route("/notifications", methods=["POST"], template="notifications.html")
+    async def notifications_action(request: Request):
+        if viewer(request) is None:
+            return Redirect("/login")
+        form = await request.form()
+        action = str(form.get("action", ""))
+        try:
+            if action == "read":
+                feed_service.mark_notification_read(str(form.get("notification_id", "")))
+                message = "Marked read."
+            elif action == "read-all":
+                feed_service.mark_all_notifications_read()
+                message = "All notifications marked read."
+            elif action == "dismiss":
+                feed_service.dismiss_notification(str(form.get("notification_id", "")))
+                message = "Notification removed."
+            else:
+                raise ValueError("Unknown notification action.")
+        except (LookupError, ValueError) as exc:
+            return render(
+                request,
+                "notifications.html",
+                error=str(exc),
+                notifications=feed_service.notifications(limit=100),
+                notification_count=feed_service.unread_notification_count(),
+            )
+        if request.headers.get("HX-Request"):
+            return render(
+                request,
+                "notifications.html",
+                error=None,
+                message=message,
+                notifications=feed_service.notifications(limit=100),
+                notification_count=feed_service.unread_notification_count(),
+            )
+        get_session()["space_message"] = message
+        return Redirect("/notifications")
+
+    @app.route("/bookmarks", template="bookmarks.html")
+    def bookmarks_page(request: Request):
+        if viewer(request) is None:
+            return Redirect("/login")
+        return render(
+            request,
+            "bookmarks.html",
+            bookmarks=feed_service.bookmarks(),
+            notification_count=feed_service.unread_notification_count(),
+        )
+
+    @app.route("/remote/{domain}/{username}", template="remote_author.html")
+    def remote_author_page(request: Request, domain: str, username: str):
+        if viewer(request) is None:
+            return Redirect("/login")
+        relationship, entries = feed_service.remote_author(domain, username)
+        if relationship is None:
+            return Response("Remote author not found or blocked.", status=404)
+        return render(
+            request,
+            "remote_author.html",
+            relationship=relationship,
+            feed_entries=entries,
+            notification_count=feed_service.unread_notification_count(),
+        )
 
     @app.route("/archive", template="content_list.html")
     def archive_page(request: Request):

@@ -278,3 +278,77 @@ class GuestbookEntry:
     submission_hash: str
     created_at: datetime
     moderated_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteObject:
+    id: str
+    actor_id: str
+    object_type: str
+    content_text: str
+    summary: str
+    in_reply_to: str | None
+    published_at: datetime
+    received_at: datetime
+    updated_at: datetime | None = None
+    deleted_at: datetime | None = None
+    unavailable: bool = False
+    activity_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Interaction:
+    id: str
+    kind: str
+    actor_id: str
+    object_id: str
+    created_at: datetime
+    reply_object_id: str | None = None
+    undone_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Bookmark:
+    object_id: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class Notification:
+    id: str
+    kind: str
+    summary: str
+    created_at: datetime
+    actor_id: str | None = None
+    object_id: str | None = None
+    activity_id: str | None = None
+    read_at: datetime | None = None
+    suppressed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FeedEntry:
+    """Owner-facing chronological feed row assembled from local and remote sources."""
+
+    event_id: str
+    event_kind: str
+    object_id: str
+    actor_id: str
+    actor_display_name: str
+    actor_handle: str
+    actor_domain: str
+    origin: str
+    canonical_url: str
+    content_text: str
+    summary: str
+    published_at: datetime
+    sort_at: datetime
+    status: str
+    in_reply_to: str | None = None
+    like_count: int = 0
+    repost_count: int = 0
+    liked_by_owner: bool = False
+    reposted_by_owner: bool = False
+    bookmarked: bool = False
+    delivery_status: str | None = None
+    updated_at: datetime | None = None

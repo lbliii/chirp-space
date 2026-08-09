@@ -77,6 +77,13 @@ legend { font-weight: 800; }
 .site-footer { align-items: center; border-top: 1px solid var(--line); color: var(--muted); display: flex; justify-content: space-between; padding-block: 1.5rem; }
 .theme-dark { color-scheme: dark; --bg: #101713; --surface: #17221c; --text: #f1f5f2; --muted: #b3c1b8; --line: #405047; --accent: #72dbb8; --accent-ink: #06291f; --danger: #ff8b98; --focus: #ffd45c; }
 .theme-light { color-scheme: light; }
+.visually-hidden { clip: rect(0 0 0 0); clip-path: inset(50%); height: 1px; overflow: hidden; position: absolute; white-space: nowrap; width: 1px; }
+.notify-list { display: grid; gap: .75rem; list-style: none; padding: 0; }
+.notify-list li { align-items: start; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); display: flex; flex-wrap: wrap; gap: 1rem; justify-content: space-between; padding: 1rem; }
+.notify-list li.unread { border-left: .3rem solid var(--accent); }
+.feed-card.status-tombstone, .feed-card.status-unavailable { border-style: dashed; }
+.feed-card.status-updated { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
+.studio { background: var(--bg); border: 1px dashed var(--line); border-radius: var(--radius); margin-top: 1rem; padding: 1rem; }
 @media (prefers-color-scheme: dark) { .theme-system { color-scheme: dark; --bg: #101713; --surface: #17221c; --text: #f1f5f2; --muted: #b3c1b8; --line: #405047; --accent: #72dbb8; --accent-ink: #06291f; --danger: #ff8b98; --focus: #ffd45c; } }
 .font-serif { --font: ui-serif, Georgia, serif; }
 .scale-compact { --size: .94rem; }

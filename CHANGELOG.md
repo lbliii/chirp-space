@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add the issue #797 chronological home feed with mixed local/remote ordering, remote-author
+  pages, replies, likes, reposts, bookmarks, notifications, and plain-request/htmx interaction
+  paths for pending, updated, tombstone, unavailable, and blocked states.
 - Add issue #799 database-backed federation rate and concurrency budgets, emergency inbound and
   outbound pause controls, per-peer queue diagnostics, bounded pseudonymous security evidence,
   owner recovery controls, and 30-day event retention while local publishing remains available.
