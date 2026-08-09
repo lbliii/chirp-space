@@ -1,0 +1,18 @@
+{% extends "layout.html" %}
+{% block title %}Bookmarks · {{ state.owner.display_name }}{% end %}
+{% block page_content %}
+<header class="page-heading">
+  <p class="eyebrow">Private to this Space</p>
+  <h1>Bookmarks</h1>
+  <p>Bookmarks never federate and are never counted publicly.</p>
+</header>
+{% if not bookmarks %}<p class="empty-state">No bookmarks yet.</p>{% end %}
+<ul class="content-links">
+{% for bookmark in bookmarks %}
+  <li>
+    <a href="{{ bookmark.object_id }}">{{ bookmark.object_id }}</a>
+    <time datetime="{{ bookmark.created_at.isoformat() }}">{{ bookmark.created_at.strftime("%Y-%m-%d") }}</time>
+  </li>
+{% end %}
+</ul>
+{% end %}

@@ -1,0 +1,119 @@
+{% extends "layout.html" %}
+{% block title %}Home feed · {{ state.owner.display_name }}{% end %}
+{% block page_content %}
+<header class="page-heading">
+  <p class="eyebrow">Chronological friend feed</p>
+  <h1>Home feed</h1>
+  <p>Strictly chronological posts from this Space and people you follow. No ranking or trending.</p>
+</header>
+{% if error is defined and error %}<div class="notice error" role="alert" tabindex="-1">{{ error }}</div>{% end %}
+{% if message is defined and message %}<div class="notice" role="status">{{ message }}</div>{% end %}
+
+<aside class="form-card" aria-labelledby="notify-title" id="notifications-panel">
+  <h2 id="notify-title">Recent notifications</h2>
+  <p>{% if notification_count %}{{ notification_count }} unread · {% endif %}<a href="/notifications">Open all notifications</a></p>
+  {% if notifications %}
+  <ul class="notify-list">
+    {% for item in notifications %}
+    <li{% if not item.read_at %} class="unread"{% endif %}>
+      <span>{{ item.summary }}</span>
+      <time datetime="{{ item.created_at.isoformat() }}">{{ item.created_at.strftime("%Y-%m-%d %H:%M") }}</time>
+    </li>
+    {% end %}
+  </ul>
+  {% else %}
+  <p class="empty-state">No notifications yet.</p>
+  {% end %}
+</aside>
+
+<section class="content-feed" aria-labelledby="feed-title" id="home-feed">
+  <h2 id="feed-title" class="visually-hidden">Feed items</h2>
+  {% if not feed_entries %}<p class="empty-state">Your feed is empty. Follow friends from Connections, or publish locally.</p>{% end %}
+  {% for entry in feed_entries %}
+  <article class="content-card feed-card status-{{ entry.status }}" aria-labelledby="entry-{{ loop.index }}">
+    <header>
+      <p class="eyebrow">
+        {% if entry.event_kind == "repost" %}Repost · {% endif %}
+        {% if entry.origin == "remote" %}
+          <a href="/remote/{{ entry.actor_domain }}/{{ entry.actor_handle }}">{{ entry.actor_display_name }}</a>
+          · <code>@{{ entry.actor_handle }}@{{ entry.actor_domain }}</code>
+          · <a href="{{ entry.canonical_url }}" rel="noopener noreferrer">Canonical origin <span aria-hidden="true">↗</span></a>
+        {% else %}
+          {{ entry.actor_display_name }} · local
+        {% endif %}
+      </p>
+      <h3 id="entry-{{ loop.index }}">{{ entry.summary }}</h3>
+      <p aria-label="Delivery and freshness">
+        <time datetime="{{ entry.published_at.isoformat() }}">{{ entry.published_at.strftime("%Y-%m-%d %H:%M") }}</time>
+        · <span>{{ entry.status }}</span>
+        {% if entry.delivery_status %} · delivery: {{ entry.delivery_status }}{% endif %}
+        {% if entry.updated_at %} · updated in place {{ entry.updated_at.strftime("%Y-%m-%d %H:%M") }}{% endif %}
+      </p>
+    </header>
+    {% if entry.status == "tombstone" %}
+      <p class="notice">This post was deleted. The identifier remains for reply context only.</p>
+    {% elif entry.status == "unavailable" %}
+      <p class="notice">Last validated copy from an unavailable node. Treat as stale.</p>
+      <div class="prose"><p>{{ entry.content_text }}</p></div>
+    {% else %}
+      <div class="prose"><p>{{ entry.content_text }}</p></div>
+    {% endif %}
+    {% if entry.in_reply_to %}<p class="hint">In reply to <a href="{{ entry.in_reply_to }}">{{ entry.in_reply_to }}</a></p>{% endif %}
+    <p class="hint" aria-label="Partial interaction counts">
+      {{ entry.like_count }} likes · {{ entry.repost_count }} reposts
+      <span class="hint">(counts are partial, from known validated edges)</span>
+    </p>
+    <div class="form-actions" aria-label="Actions for this post">
+      <form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">
+        {{ csrf_field() }}
+        <input type="hidden" name="action" value="{% if entry.liked_by_owner %}unlike{% else %}like{% endif %}">
+        <input type="hidden" name="object_id" value="{{ entry.object_id }}">
+        <button class="button" type="submit">{% if entry.liked_by_owner %}Unlike{% else %}Like{% endif %}</button>
+      </form>
+      <form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">
+        {{ csrf_field() }}
+        <input type="hidden" name="action" value="{% if entry.reposted_by_owner %}unrepost{% else %}repost{% endif %}">
+        <input type="hidden" name="object_id" value="{{ entry.object_id }}">
+        <button class="button" type="submit">{% if entry.reposted_by_owner %}Remove repost{% else %}Repost{% endif %}</button>
+      </form>
+      <form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">
+        {{ csrf_field() }}
+        <input type="hidden" name="action" value="{% if entry.bookmarked %}unbookmark{% else %}bookmark{% endif %}">
+        <input type="hidden" name="object_id" value="{{ entry.object_id }}">
+        <button class="button" type="submit">{% if entry.bookmarked %}Remove bookmark{% else %}Bookmark{% endif %}</button>
+      </form>
+      {% if entry.origin == "remote" and entry.status != "unavailable" %}
+      <form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">
+        {{ csrf_field() }}
+        <input type="hidden" name="action" value="mark-unavailable">
+        <input type="hidden" name="object_id" value="{{ entry.object_id }}">
+        <button class="button" type="submit">Mark unavailable</button>
+      </form>
+      {% endif %}
+    </div>
+    {% if entry.status != "tombstone" %}
+    <form method="post" class="studio" hx-target="#page-root" hx-swap="outerHTML show:top" aria-label="Reply">
+      {{ csrf_field() }}
+      <input type="hidden" name="action" value="reply">
+      <input type="hidden" name="object_id" value="{{ entry.object_id }}">
+      <label>Reply
+        <textarea name="source" rows="3" maxlength="4000" required></textarea>
+      </label>
+      <label>Visibility
+        <select name="visibility">
+          <option value="public">Public</option>
+          <option value="unlisted">Unlisted</option>
+          <option value="followers">Followers</option>
+          <option value="local">Local only</option>
+        </select>
+      </label>
+      <button class="button primary" type="submit">Reply</button>
+    </form>
+    {% endif %}
+  </article>
+  {% end %}
+  {% if next_cursor %}
+  <p><a class="button" href="/home?cursor={{ next_cursor }}">Older posts</a></p>
+  {% endif %}
+</section>
+{% end %}

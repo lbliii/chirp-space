@@ -1,0 +1,50 @@
+{% extends "layout.html" %}
+{% block title %}Notifications · {{ state.owner.display_name }}{% end %}
+{% block page_content %}
+<header class="page-heading">
+  <p class="eyebrow">Local projections only</p>
+  <h1>Notifications</h1>
+  <p>Validated events on this Space. Read state is local UI only — there are no read receipts or push services.</p>
+</header>
+{% if error is defined and error %}<div class="notice error" role="alert" tabindex="-1">{{ error }}</div>{% end %}
+{% if message is defined and message %}<div class="notice" role="status">{{ message }}</div>{% end %}
+
+<form method="post" class="form-actions" hx-target="#page-root" hx-swap="outerHTML show:top">
+  {{ csrf_field() }}
+  <input type="hidden" name="action" value="read-all">
+  <button class="button" type="submit">Mark all read</button>
+</form>
+
+<section id="notifications-list" aria-labelledby="notifications-heading">
+  <h2 id="notifications-heading" class="visually-hidden">Notification list</h2>
+  {% if not notifications %}<p class="empty-state">No notifications.</p>{% end %}
+  <ul class="notify-list">
+  {% for item in notifications %}
+    <li{% if not item.read_at %} class="unread"{% endif %}>
+      <div>
+        <strong>{{ item.kind }}</strong>
+        <p>{{ item.summary }}</p>
+        <time datetime="{{ item.created_at.isoformat() }}">{{ item.created_at.strftime("%Y-%m-%d %H:%M") }}</time>
+        {% if item.object_id %}<p class="hint"><a href="{{ item.object_id }}">Related object</a></p>{% endif %}
+      </div>
+      <div class="form-actions">
+        {% if not item.read_at %}
+        <form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">
+          {{ csrf_field() }}
+          <input type="hidden" name="action" value="read">
+          <input type="hidden" name="notification_id" value="{{ item.id }}">
+          <button class="button" type="submit">Mark read</button>
+        </form>
+        {% endif %}
+        <form method="post" class="inline-form" hx-target="#page-root" hx-swap="outerHTML show:top">
+          {{ csrf_field() }}
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="notification_id" value="{{ item.id }}">
+          <button class="button" type="submit">Dismiss</button>
+        </form>
+      </div>
+    </li>
+  {% end %}
+  </ul>
+</section>
+{% end %}
