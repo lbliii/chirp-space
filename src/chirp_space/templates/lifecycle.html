@@ -1,0 +1,98 @@
+{% extends "layout.html" %}
+{% block title %}Lifecycle · {{ state.owner.display_name }}{% end %}
+{% block page_content %}
+<header class="page-heading">
+  <p class="eyebrow">Ownership controls</p>
+  <h1>Export, restore, and deletion</h1>
+  <p>These controls keep your data portable without inventing federation guarantees that contract v1 does not provide.</p>
+</header>
+{% if error %}<div class="notice error" role="alert" tabindex="-1">{{ error }}</div>{% end %}
+{% if message %}<div class="notice" role="status">{{ message }}</div>{% end %}
+
+<section class="critical-card" aria-labelledby="disclosure-title">
+  <h2 id="disclosure-title">Retention honesty</h2>
+  <p>{{ retention_disclosure }}</p>
+</section>
+
+<section class="form-card" aria-labelledby="export-title">
+  <h2 id="export-title">Export backup</h2>
+  <p>Download a versioned ZIP envelope with profile, settings, modules, content, media checksums, relationships, and encrypted signing keys. Plaintext private keys are never included.</p>
+  <p><a class="button primary" href="/owner/lifecycle/export" hx-boost="false">Download export</a></p>
+</section>
+
+<section class="form-card" aria-labelledby="restore-title">
+  <h2 id="restore-title">Preview and restore</h2>
+  <p>Preview validates envelope version, integrity, and conflicts. Restore replaces local owner state transactionally and requires typing <code>{{ restore_confirmation }}</code>.</p>
+  <form method="post" enctype="multipart/form-data" hx-boost="false">
+    {{ csrf_field() }}
+    <label>Export ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label>
+    <div class="button-row">
+      <button class="button" name="action" value="preview-restore" type="submit">Preview import</button>
+    </div>
+  </form>
+  {% if preview %}
+  <article class="card" aria-labelledby="preview-summary">
+    <h3 id="preview-summary">Import preview</h3>
+    <p>Envelope v{{ preview.envelope_version }} · @{{ preview.handle }} · site <code>{{ preview.site_id }}</code></p>
+    <p>{{ preview.content_count }} content · {{ preview.media_count }} media · {{ preview.relationship_count }} relationships · {{ preview.guestbook_count }} guestbook</p>
+    {% if preview.conflicts %}<ul>{% for item in preview.conflicts %}<li>{{ item }}</li>{% end %}</ul>{% end %}
+    {% if preview.warnings %}<ul>{% for item in preview.warnings %}<li>{{ item }}</li>{% end %}</ul>{% end %}
+    {% if preview.media_missing %}<p>Missing media keys: {% for key in preview.media_missing %}<code>{{ key }}</code> {% end %}</p>{% end %}
+  </article>
+  {% end %}
+  <form method="post" class="critical-card" enctype="multipart/form-data" hx-boost="false">
+    {{ csrf_field() }}
+    <input type="hidden" name="action" value="restore">
+    <label>Export ZIP<input name="archive" type="file" accept=".zip,application/zip" required></label>
+    <label>Current password<input name="password" type="password" autocomplete="current-password" required></label>
+    <label>Type {{ restore_confirmation }} to confirm<input name="confirmation" autocomplete="off" required></label>
+    <button class="danger-button" type="submit">Replace local Space from archive</button>
+  </form>
+</section>
+
+<section class="form-card" aria-labelledby="rotate-title">
+  <h2 id="rotate-title">Rotate signing key</h2>
+  <p>Creates a new active RSA key. The previous public key remains fetchable for 30 days. Type <code>{{ rotate_confirmation }}</code>.</p>
+  <form method="post" hx-target="#page-root" hx-swap="outerHTML show:top">
+    {{ csrf_field() }}
+    <input type="hidden" name="action" value="rotate-key">
+    <label>Current password<input name="password" type="password" autocomplete="current-password" required></label>
+    <label>Confirmation<input name="confirmation" autocomplete="off" required></label>
+    <button class="button" type="submit">Rotate signing key</button>
+  </form>
+</section>
+
+<section class="form-card" aria-labelledby="migrate-title">
+  <h2 id="migrate-title">Canonical origin migration</h2>
+  <p>Local <code>site_settings.canonical_origin</code> can move to the deployment value <code>{{ config_canonical_origin }}</code>. ActivityPub <code>Move</code> is outside federation contract v1; federated actor IDs at the old origin do not migrate.</p>
+  <form method="post" class="critical-card" hx-target="#page-root" hx-swap="outerHTML show:top">
+    {{ csrf_field() }}
+    <input type="hidden" name="action" value="migrate-origin">
+    <label>Current password<input name="password" type="password" autocomplete="current-password" required></label>
+    <label>Type {{ migrate_confirmation }} to confirm<input name="confirmation" autocomplete="off" required></label>
+    <label><input type="checkbox" name="acknowledge_federation_break" value="on"> I understand Move is unsupported and federation identity continuity will break.</label>
+    <button class="danger-button" type="submit">Migrate canonical origin</button>
+  </form>
+</section>
+
+<section class="critical-card" aria-labelledby="delete-title">
+  <h2 id="delete-title">Delete this Space</h2>
+  <p>Permanently purge local database rows and media objects. Remote Undo of outbound Follows is best-effort only. Type <code>{{ delete_confirmation }}</code>.</p>
+  {% if deletion_report %}
+  <div class="notice" role="status">
+    <p>Local purged: {{ deletion_report.local_purged }} · remote Undos enqueued: {{ deletion_report.remote_undos_enqueued }}</p>
+    <p>{{ deletion_report.retention_disclosure }}</p>
+    {% if deletion_report.notes %}<ul>{% for note in deletion_report.notes %}<li>{{ note }}</li>{% end %}</ul>{% end %}
+  </div>
+  {% else %}
+  <form method="post" hx-boost="false">
+    {{ csrf_field() }}
+    <input type="hidden" name="action" value="delete-space">
+    <label>Current password<input name="password" type="password" autocomplete="current-password" required></label>
+    <label>Type {{ delete_confirmation }} to confirm<input name="confirmation" autocomplete="off" required></label>
+    <label><input type="checkbox" name="attempt_remote" value="on" checked> Attempt best-effort remote Undo Follow delivery before local purge</label>
+    <button class="danger-button" type="submit">Permanently delete local Space</button>
+  </form>
+  {% end %}
+</section>
+{% end %}

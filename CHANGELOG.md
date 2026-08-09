@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add issue #800 ownership lifecycle: versioned export/import envelope, transactional restore with
+  preview and fail-closed integrity checks, signing-key rotation confirmation, local canonical-origin
+  migration that refuses silent federation Move claims, permanent local deletion with honest remote
+  retention disclosure, owner lifecycle page, and export/import CLI commands.
 - Add the issue #797 chronological home feed with mixed local/remote ordering, remote-author
   pages, replies, likes, reposts, bookmarks, notifications, and plain-request/htmx interaction
   paths for pending, updated, tombstone, unavailable, and blocked states.

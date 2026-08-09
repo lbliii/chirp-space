@@ -38,10 +38,41 @@ from chirp_space.models import (
     SecurityEvent,
     SiteSettings,
     SiteState,
+    SpaceDataSnapshot,
     Theme,
 )
 
 MAX_ACTIVE_DELIVERIES = 10_000
+LIFECYCLE_PURGE_STATEMENTS = (
+    "DELETE FROM circle_members",
+    "DELETE FROM circles",
+    "DELETE FROM interactions",
+    "DELETE FROM bookmarks",
+    "DELETE FROM notifications",
+    "DELETE FROM remote_objects",
+    "DELETE FROM relationships",
+    "DELETE FROM remote_actors",
+    "DELETE FROM domain_blocks",
+    "DELETE FROM deliveries",
+    "DELETE FROM outbound_activities",
+    "DELETE FROM delivery_peers",
+    "DELETE FROM inbox_receipts",
+    "DELETE FROM federation_leases",
+    "DELETE FROM federation_rate_buckets",
+    "DELETE FROM security_events",
+    "DELETE FROM content_tags",
+    "DELETE FROM content_items",
+    "DELETE FROM media_variants",
+    "DELETE FROM media_assets",
+    "DELETE FROM tags",
+    "DELETE FROM guestbook_entries",
+    "DELETE FROM owner_sessions",
+    "DELETE FROM recovery_codes",
+    "DELETE FROM profile_modules",
+    "DELETE FROM federation_keys",
+    "DELETE FROM owners",
+    "DELETE FROM site_settings",
+)
 
 SQLITE_MIGRATION = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -771,6 +802,16 @@ class Store(Protocol):
     def mark_all_notifications_read(self, *, read_at: datetime) -> int: ...
     def delete_notification(self, notification_id: str) -> None: ...
     def delivery_status_by_object(self) -> dict[str, str]: ...
+
+    def unused_recovery_code_hashes(self, owner_id: str) -> tuple[str, ...]: ...
+    def federation_keys(self) -> tuple[FederationKey, ...]: ...
+    def export_content_items(self) -> tuple[ContentItem, ...]: ...
+    def export_media_assets(self) -> tuple[MediaAsset, ...]: ...
+    def update_canonical_origin(
+        self, canonical_origin: str, *, expected_revision: int, now: datetime
+    ) -> SiteSettings: ...
+    def purge_lifecycle_data(self) -> None: ...
+    def replace_lifecycle_snapshot(self, snapshot: SpaceDataSnapshot) -> None: ...
 
 
 class SQLiteStore:
@@ -2092,6 +2133,332 @@ class SQLiteStore:
         if row is None:
             raise RuntimeError("Guestbook entry does not exist or is deleted.")
         return _guestbook_from_mapping(row)
+
+    def unused_recovery_code_hashes(self, owner_id: str) -> tuple[str, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT code_hash FROM recovery_codes
+                WHERE owner_id = ? AND used_at IS NULL ORDER BY code_hash""",
+                (owner_id,),
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def federation_keys(self) -> tuple[FederationKey, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM federation_keys
+                ORDER BY created_at, id"""
+            ).fetchall()
+        return tuple(
+            FederationKey(
+                id=str(row["id"]),
+                public_pem=str(row["public_pem"]),
+                encrypted_private_pem=bytes(row["encrypted_private_pem"]),
+                created_at=_datetime(row["created_at"]),
+                retired_at=_datetime(row["retired_at"]) if row["retired_at"] else None,
+            )
+            for row in rows
+        )
+
+    def export_content_items(self) -> tuple[ContentItem, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM content_items
+                ORDER BY created_at, id"""
+            ).fetchall()
+            return tuple(self._content_from_row(row) for row in rows)
+
+    def export_media_assets(self) -> tuple[MediaAsset, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id FROM media_assets ORDER BY created_at, id"
+            ).fetchall()
+        assets = tuple(self.media(str(row[0])) for row in rows)
+        return tuple(asset for asset in assets if asset is not None)
+
+    def update_canonical_origin(
+        self, canonical_origin: str, *, expected_revision: int, now: datetime
+    ) -> SiteSettings:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                updated = self._connection.execute(
+                    """UPDATE site_settings
+                    SET canonical_origin = ?, revision = ?, updated_at = ?
+                    WHERE singleton_id = 1 AND revision = ?""",
+                    (canonical_origin, expected_revision + 1, _iso(now), expected_revision),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError(
+                        "Canonical origin could not be updated; reload and try again."
+                    )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        state = self.state()
+        if state is None:
+            raise RuntimeError("Space setup is incomplete.")
+        return state.settings
+
+    def purge_lifecycle_data(self) -> None:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                for statement in LIFECYCLE_PURGE_STATEMENTS:
+                    self._connection.execute(statement)
+                now = datetime.now(UTC)
+                self._connection.execute(
+                    """UPDATE federation_controls
+                    SET inbound_paused = 0, outbound_paused = 0, reason = '',
+                        revision = 1, updated_at = ?
+                    WHERE singleton_id = 1""",
+                    (_iso(now),),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    def replace_lifecycle_snapshot(self, snapshot: SpaceDataSnapshot) -> None:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                for statement in LIFECYCLE_PURGE_STATEMENTS:
+                    self._connection.execute(statement)
+                owner = snapshot.owner
+                settings = snapshot.settings
+                self._connection.execute(
+                    """INSERT INTO owners(
+                        singleton_id, id, handle, display_name, bio, location, website_url,
+                        password_hash, claimed_at
+                    ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        owner.id,
+                        owner.handle,
+                        owner.display_name,
+                        owner.bio,
+                        owner.location,
+                        owner.website_url,
+                        owner.password_hash,
+                        _iso(owner.claimed_at),
+                    ),
+                )
+                self._insert_settings(settings)
+                self._insert_modules(snapshot.modules, settings.updated_at)
+                self._connection.executemany(
+                    "INSERT INTO recovery_codes(owner_id, code_hash) VALUES (?, ?)",
+                    [(owner.id, value) for value in snapshot.recovery_code_hashes],
+                )
+                for key in snapshot.federation_keys:
+                    self._connection.execute(
+                        """INSERT INTO federation_keys(
+                            id, public_pem, encrypted_private_pem, created_at, retired_at
+                        ) VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            key.id,
+                            key.public_pem,
+                            key.encrypted_private_pem,
+                            _iso(key.created_at),
+                            _iso(key.retired_at) if key.retired_at else None,
+                        ),
+                    )
+                for asset in snapshot.media_assets:
+                    self._connection.execute(
+                        """INSERT INTO media_assets(
+                            id, object_key, media_type, width, height, byte_size, checksum,
+                            alt_text, status, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            asset.id,
+                            asset.object_key,
+                            asset.media_type,
+                            asset.width,
+                            asset.height,
+                            asset.byte_size,
+                            asset.checksum,
+                            asset.alt_text,
+                            asset.status,
+                            _iso(asset.created_at),
+                        ),
+                    )
+                    for variant in asset.variants:
+                        self._connection.execute(
+                            """INSERT INTO media_variants(
+                                asset_id, name, object_key, media_type, width, height,
+                                byte_size, checksum
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                asset.id,
+                                variant.name,
+                                variant.object_key,
+                                variant.media_type,
+                                variant.width,
+                                variant.height,
+                                variant.byte_size,
+                                variant.checksum,
+                            ),
+                        )
+                for item in snapshot.content_items:
+                    self._connection.execute(
+                        """INSERT INTO content_items(
+                            id, owner_id, kind, state, title, source, external_url, media_id,
+                            revision, created_at, updated_at, published_at, deleted_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        _content_values(item, sqlite=True),
+                    )
+                    for tag in item.tags:
+                        self._connection.execute(
+                            "INSERT OR IGNORE INTO tags(slug, name) VALUES (?, ?)",
+                            (tag, tag),
+                        )
+                        self._connection.execute(
+                            "INSERT OR IGNORE INTO content_tags(content_id, tag_slug) VALUES (?, ?)",
+                            (item.id, tag),
+                        )
+                for entry in snapshot.guestbook_entries:
+                    self._connection.execute(
+                        """INSERT INTO guestbook_entries(
+                            id, display_name, message, website_url, status, abuse_token,
+                            submission_hash, created_at, moderated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            entry.id,
+                            entry.display_name,
+                            entry.message,
+                            entry.website_url,
+                            entry.status,
+                            entry.abuse_token,
+                            entry.submission_hash,
+                            _iso(entry.created_at),
+                            _iso(entry.moderated_at) if entry.moderated_at else None,
+                        ),
+                    )
+                for relationship in snapshot.relationships:
+                    actor = relationship.actor
+                    self._connection.execute(
+                        """INSERT INTO remote_actors(
+                            id, inbox_url, preferred_username, display_name, domain,
+                            last_contact_at, deleted_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            actor.id,
+                            actor.inbox_url,
+                            actor.preferred_username,
+                            actor.display_name,
+                            actor.domain,
+                            _iso(actor.last_contact_at),
+                            _iso(actor.deleted_at) if actor.deleted_at else None,
+                        ),
+                    )
+                    self._connection.execute(
+                        """INSERT INTO relationships(
+                            actor_id, outbound_state, inbound_state, outbound_follow_id,
+                            inbound_follow_id, pinned, muted, blocked, unavailable, note,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            actor.id,
+                            relationship.outbound_state,
+                            relationship.inbound_state,
+                            relationship.outbound_follow_id,
+                            relationship.inbound_follow_id,
+                            int(relationship.pinned),
+                            int(relationship.muted),
+                            int(relationship.blocked),
+                            int(relationship.unavailable),
+                            relationship.note,
+                            _iso(relationship.updated_at),
+                        ),
+                    )
+                for domain in snapshot.blocked_domains:
+                    self._connection.execute(
+                        "INSERT OR IGNORE INTO domain_blocks(domain, created_at) VALUES (?, ?)",
+                        (domain, _iso(settings.updated_at)),
+                    )
+                for circle in snapshot.circles:
+                    self._connection.execute(
+                        "INSERT INTO circles(id, name, created_at) VALUES (?, ?, ?)",
+                        (circle.id, circle.name, _iso(circle.created_at)),
+                    )
+                    for actor_id in circle.member_actor_ids:
+                        self._connection.execute(
+                            """INSERT OR IGNORE INTO circle_members(circle_id, actor_id)
+                            VALUES (?, ?)""",
+                            (circle.id, actor_id),
+                        )
+                for obj in snapshot.remote_objects:
+                    self._connection.execute(
+                        """INSERT INTO remote_objects(
+                            id, actor_id, object_type, content_text, summary, in_reply_to,
+                            published_at, received_at, updated_at, deleted_at, unavailable,
+                            activity_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            obj.id,
+                            obj.actor_id,
+                            obj.object_type,
+                            obj.content_text,
+                            obj.summary,
+                            obj.in_reply_to,
+                            _iso(obj.published_at),
+                            _iso(obj.received_at),
+                            _iso(obj.updated_at) if obj.updated_at else None,
+                            _iso(obj.deleted_at) if obj.deleted_at else None,
+                            int(obj.unavailable),
+                            obj.activity_id,
+                        ),
+                    )
+                for item in snapshot.interactions:
+                    self._connection.execute(
+                        """INSERT INTO interactions(
+                            id, kind, actor_id, object_id, reply_object_id, created_at, undone_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            item.id,
+                            item.kind,
+                            item.actor_id,
+                            item.object_id,
+                            item.reply_object_id,
+                            _iso(item.created_at),
+                            _iso(item.undone_at) if item.undone_at else None,
+                        ),
+                    )
+                for bookmark in snapshot.bookmarks:
+                    self._connection.execute(
+                        "INSERT INTO bookmarks(object_id, created_at) VALUES (?, ?)",
+                        (bookmark.object_id, _iso(bookmark.created_at)),
+                    )
+                for note in snapshot.notifications:
+                    self._connection.execute(
+                        """INSERT INTO notifications(
+                            id, kind, summary, actor_id, object_id, activity_id,
+                            created_at, read_at, suppressed
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            note.id,
+                            note.kind,
+                            note.summary,
+                            note.actor_id,
+                            note.object_id,
+                            note.activity_id,
+                            _iso(note.created_at),
+                            _iso(note.read_at) if note.read_at else None,
+                            int(note.suppressed),
+                        ),
+                    )
+                now = datetime.now(UTC)
+                self._connection.execute(
+                    """UPDATE federation_controls
+                    SET inbound_paused = 0, outbound_paused = 0, reason = '',
+                        revision = 1, updated_at = ?
+                    WHERE singleton_id = 1""",
+                    (_iso(now),),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
 
     def upsert_remote_object(self, obj: RemoteObject) -> RemoteObject:
         with self._lock:
@@ -3570,6 +3937,327 @@ class PostgresStore:
         if row is None:
             raise RuntimeError("Guestbook entry does not exist or is deleted.")
         return _guestbook_from_sequence(row)
+
+    def unused_recovery_code_hashes(self, owner_id: str) -> tuple[str, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT code_hash FROM recovery_codes
+                WHERE owner_id = %s AND used_at IS NULL ORDER BY code_hash""",
+                (owner_id,),
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def federation_keys(self) -> tuple[FederationKey, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT id, public_pem, encrypted_private_pem, created_at, retired_at
+                FROM federation_keys ORDER BY created_at, id"""
+            ).fetchall()
+        return tuple(
+            FederationKey(
+                id=str(row[0]),
+                public_pem=str(row[1]),
+                encrypted_private_pem=bytes(row[2]),
+                created_at=_datetime(row[3]),
+                retired_at=_datetime(row[4]) if row[4] else None,
+            )
+            for row in rows
+        )
+
+    def export_content_items(self) -> tuple[ContentItem, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT id FROM content_items ORDER BY created_at, id"""
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = self.content_item(str(row[0]))
+            if item is not None:
+                items.append(item)
+        return tuple(items)
+
+    def export_media_assets(self) -> tuple[MediaAsset, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                "SELECT id FROM media_assets ORDER BY created_at, id"
+            ).fetchall()
+        assets = tuple(self.media(str(row[0])) for row in rows)
+        return tuple(asset for asset in assets if asset is not None)
+
+    def update_canonical_origin(
+        self, canonical_origin: str, *, expected_revision: int, now: datetime
+    ) -> SiteSettings:
+        with self._pool.connection() as connection, connection.transaction():
+            updated = connection.execute(
+                """UPDATE site_settings
+                SET canonical_origin = %s, revision = %s, updated_at = %s
+                WHERE singleton_id = 1 AND revision = %s""",
+                (canonical_origin, expected_revision + 1, now, expected_revision),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("Canonical origin could not be updated; reload and try again.")
+        state = self.state()
+        if state is None:
+            raise RuntimeError("Space setup is incomplete.")
+        return state.settings
+
+    def purge_lifecycle_data(self) -> None:
+        with self._pool.connection() as connection, connection.transaction():
+            connection.execute("SELECT pg_advisory_xact_lock(800)")
+            for statement in LIFECYCLE_PURGE_STATEMENTS:
+                connection.execute(statement)
+            connection.execute(
+                """UPDATE federation_controls
+                SET inbound_paused = FALSE, outbound_paused = FALSE, reason = '',
+                    revision = 1, updated_at = now()
+                WHERE singleton_id = 1"""
+            )
+
+    def replace_lifecycle_snapshot(self, snapshot: SpaceDataSnapshot) -> None:
+        with self._pool.connection() as connection, connection.transaction():
+            connection.execute("SELECT pg_advisory_xact_lock(800)")
+            for statement in LIFECYCLE_PURGE_STATEMENTS:
+                connection.execute(statement)
+            owner = snapshot.owner
+            settings = snapshot.settings
+            connection.execute(
+                """INSERT INTO owners(
+                    singleton_id, id, handle, display_name, bio, location, website_url,
+                    password_hash, claimed_at
+                ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    owner.id,
+                    owner.handle,
+                    owner.display_name,
+                    owner.bio,
+                    owner.location,
+                    owner.website_url,
+                    owner.password_hash,
+                    owner.claimed_at,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO site_settings(
+                    singleton_id, id, canonical_origin, palette, font, scale, density, radius,
+                    layout_width, revision, updated_at
+                ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                _settings_values(settings),
+            )
+            connection.cursor().executemany(
+                """INSERT INTO profile_modules(kind, enabled, position, config_json, updated_at)
+                VALUES (%s, %s, %s, %s, %s)""",
+                _module_values(snapshot.modules, settings.updated_at),
+            )
+            connection.cursor().executemany(
+                "INSERT INTO recovery_codes(owner_id, code_hash) VALUES (%s, %s)",
+                [(owner.id, value) for value in snapshot.recovery_code_hashes],
+            )
+            for key in snapshot.federation_keys:
+                connection.execute(
+                    """INSERT INTO federation_keys(
+                        id, public_pem, encrypted_private_pem, created_at, retired_at
+                    ) VALUES (%s, %s, %s, %s, %s)""",
+                    (
+                        key.id,
+                        key.public_pem,
+                        key.encrypted_private_pem,
+                        key.created_at,
+                        key.retired_at,
+                    ),
+                )
+            for asset in snapshot.media_assets:
+                connection.execute(
+                    """INSERT INTO media_assets(
+                        id, object_key, media_type, width, height, byte_size, checksum,
+                        alt_text, status, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        asset.id,
+                        asset.object_key,
+                        asset.media_type,
+                        asset.width,
+                        asset.height,
+                        asset.byte_size,
+                        asset.checksum,
+                        asset.alt_text,
+                        asset.status,
+                        asset.created_at,
+                    ),
+                )
+                for variant in asset.variants:
+                    connection.execute(
+                        """INSERT INTO media_variants(
+                            asset_id, name, object_key, media_type, width, height,
+                            byte_size, checksum
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (
+                            asset.id,
+                            variant.name,
+                            variant.object_key,
+                            variant.media_type,
+                            variant.width,
+                            variant.height,
+                            variant.byte_size,
+                            variant.checksum,
+                        ),
+                    )
+            for item in snapshot.content_items:
+                connection.execute(
+                    """INSERT INTO content_items(
+                        id, owner_id, kind, state, title, source, external_url, media_id,
+                        revision, created_at, updated_at, published_at, deleted_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    _content_values(item, sqlite=False),
+                )
+                for tag in item.tags:
+                    connection.execute(
+                        """INSERT INTO tags(slug, name) VALUES (%s, %s)
+                        ON CONFLICT(slug) DO NOTHING""",
+                        (tag, tag),
+                    )
+                    connection.execute(
+                        """INSERT INTO content_tags(content_id, tag_slug) VALUES (%s, %s)
+                        ON CONFLICT DO NOTHING""",
+                        (item.id, tag),
+                    )
+            for entry in snapshot.guestbook_entries:
+                connection.execute(
+                    """INSERT INTO guestbook_entries(
+                        id, display_name, message, website_url, status, abuse_token,
+                        submission_hash, created_at, moderated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        entry.id,
+                        entry.display_name,
+                        entry.message,
+                        entry.website_url,
+                        entry.status,
+                        entry.abuse_token,
+                        entry.submission_hash,
+                        entry.created_at,
+                        entry.moderated_at,
+                    ),
+                )
+            for relationship in snapshot.relationships:
+                actor = relationship.actor
+                connection.execute(
+                    """INSERT INTO remote_actors(
+                        id, inbox_url, preferred_username, display_name, domain,
+                        last_contact_at, deleted_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        actor.id,
+                        actor.inbox_url,
+                        actor.preferred_username,
+                        actor.display_name,
+                        actor.domain,
+                        actor.last_contact_at,
+                        actor.deleted_at,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO relationships(
+                        actor_id, outbound_state, inbound_state, outbound_follow_id,
+                        inbound_follow_id, pinned, muted, blocked, unavailable, note,
+                        updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        actor.id,
+                        relationship.outbound_state,
+                        relationship.inbound_state,
+                        relationship.outbound_follow_id,
+                        relationship.inbound_follow_id,
+                        relationship.pinned,
+                        relationship.muted,
+                        relationship.blocked,
+                        relationship.unavailable,
+                        relationship.note,
+                        relationship.updated_at,
+                    ),
+                )
+            for domain in snapshot.blocked_domains:
+                connection.execute(
+                    """INSERT INTO domain_blocks(domain, created_at) VALUES (%s, %s)
+                    ON CONFLICT(domain) DO NOTHING""",
+                    (domain, settings.updated_at),
+                )
+            for circle in snapshot.circles:
+                connection.execute(
+                    "INSERT INTO circles(id, name, created_at) VALUES (%s, %s, %s)",
+                    (circle.id, circle.name, circle.created_at),
+                )
+                for actor_id in circle.member_actor_ids:
+                    connection.execute(
+                        """INSERT INTO circle_members(circle_id, actor_id) VALUES (%s, %s)
+                        ON CONFLICT DO NOTHING""",
+                        (circle.id, actor_id),
+                    )
+            for obj in snapshot.remote_objects:
+                connection.execute(
+                    """INSERT INTO remote_objects(
+                        id, actor_id, object_type, content_text, summary, in_reply_to,
+                        published_at, received_at, updated_at, deleted_at, unavailable,
+                        activity_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        obj.id,
+                        obj.actor_id,
+                        obj.object_type,
+                        obj.content_text,
+                        obj.summary,
+                        obj.in_reply_to,
+                        obj.published_at,
+                        obj.received_at,
+                        obj.updated_at,
+                        obj.deleted_at,
+                        obj.unavailable,
+                        obj.activity_id,
+                    ),
+                )
+            for item in snapshot.interactions:
+                connection.execute(
+                    """INSERT INTO interactions(
+                        id, kind, actor_id, object_id, reply_object_id, created_at, undone_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        item.id,
+                        item.kind,
+                        item.actor_id,
+                        item.object_id,
+                        item.reply_object_id,
+                        item.created_at,
+                        item.undone_at,
+                    ),
+                )
+            for bookmark in snapshot.bookmarks:
+                connection.execute(
+                    "INSERT INTO bookmarks(object_id, created_at) VALUES (%s, %s)",
+                    (bookmark.object_id, bookmark.created_at),
+                )
+            for note in snapshot.notifications:
+                connection.execute(
+                    """INSERT INTO notifications(
+                        id, kind, summary, actor_id, object_id, activity_id,
+                        created_at, read_at, suppressed
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        note.id,
+                        note.kind,
+                        note.summary,
+                        note.actor_id,
+                        note.object_id,
+                        note.activity_id,
+                        note.created_at,
+                        note.read_at,
+                        note.suppressed,
+                    ),
+                )
+            connection.execute(
+                """UPDATE federation_controls
+                SET inbound_paused = FALSE, outbound_paused = FALSE, reason = '',
+                    revision = 1, updated_at = now()
+                WHERE singleton_id = 1"""
+            )
 
     def upsert_remote_object(self, obj: RemoteObject) -> RemoteObject:
         with self._pool.connection() as connection:

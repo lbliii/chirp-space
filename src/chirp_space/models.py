@@ -352,3 +352,24 @@ class FeedEntry:
     bookmarked: bool = False
     delivery_status: str | None = None
     updated_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SpaceDataSnapshot:
+    """Owner-controlled Space state captured for export envelope v1."""
+
+    owner: Owner
+    settings: SiteSettings
+    modules: tuple[ProfileModule, ...]
+    recovery_code_hashes: tuple[str, ...]
+    federation_keys: tuple[FederationKey, ...]
+    relationships: tuple[Relationship, ...]
+    circles: tuple[Circle, ...]
+    blocked_domains: tuple[str, ...]
+    content_items: tuple[ContentItem, ...]
+    media_assets: tuple[MediaAsset, ...]
+    guestbook_entries: tuple[GuestbookEntry, ...]
+    remote_objects: tuple[RemoteObject, ...] = ()
+    interactions: tuple[Interaction, ...] = ()
+    bookmarks: tuple[Bookmark, ...] = ()
+    notifications: tuple[Notification, ...] = ()

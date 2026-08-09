@@ -43,6 +43,15 @@ from chirp_space.federation import (
     parse_json_object,
 )
 from chirp_space.feed import FeedService
+from chirp_space.lifecycle import (
+    DELETE_CONFIRMATION,
+    MIGRATE_CONFIRMATION,
+    RESTORE_CONFIRMATION,
+    RETENTION_DISCLOSURE,
+    ROTATE_CONFIRMATION,
+    LifecycleError,
+    SpaceLifecycleService,
+)
 from chirp_space.media import PillowImageNormalizer
 from chirp_space.models import ContentItem, Customization, Owner, SiteState
 from chirp_space.relationships import RelationshipService
@@ -82,6 +91,13 @@ def create_app(
     federation = FederationService(database, config, fetcher=protocol_fetcher)
     delivery = DeliveryService(database, federation)
     relationships = RelationshipService(database, delivery, protocol_fetcher)
+    lifecycle = SpaceLifecycleService(
+        database,
+        config,
+        storage,
+        federation=federation,
+        relationships=relationships,
+    )
     feed_service = FeedService(database, config, delivery)
     app_config = AppConfig(
         template_dir=TEMPLATES,
@@ -1136,6 +1152,116 @@ def create_app(
             },
             headers={"Content-Disposition": 'attachment; filename="federation-events.json"'},
         )
+
+    def lifecycle_page(request: Request, **context: object) -> Page:
+        return render(
+            request,
+            "lifecycle.html",
+            retention_disclosure=RETENTION_DISCLOSURE,
+            delete_confirmation=DELETE_CONFIRMATION,
+            restore_confirmation=RESTORE_CONFIRMATION,
+            migrate_confirmation=MIGRATE_CONFIRMATION,
+            rotate_confirmation=ROTATE_CONFIRMATION,
+            config_canonical_origin=config.canonical_origin,
+            message=get_session().pop("space_message", None),
+            **context,
+        )
+
+    @app.route("/owner/lifecycle", template="lifecycle.html")
+    def owner_lifecycle(request: Request):
+        if viewer(request) is None:
+            return Redirect("/login")
+        if database.state() is None:
+            return Redirect("/setup")
+        return lifecycle_page(request, error=None, preview=None, deletion_report=None)
+
+    @app.route("/owner/lifecycle/export", referenced=True)
+    def owner_lifecycle_export(request: Request):
+        if viewer(request) is None:
+            return Response("Not found", status=404)
+        try:
+            archive = lifecycle.export_archive()
+        except LifecycleError as exc:
+            return Response(str(exc), status=400)
+        return (
+            Response(archive)
+            .with_status(200)
+            .with_content_type("application/zip")
+            .with_header("Content-Disposition", 'attachment; filename="chirp-space-export.zip"')
+            .with_header("Cache-Control", "no-store")
+        )
+
+    @app.route("/owner/lifecycle", methods=["POST"], template="lifecycle.html")
+    async def owner_lifecycle_submit(request: Request):
+        owner = viewer(request)
+        if owner is None:
+            return Redirect("/login")
+        form = await request.form()
+        action = str(form.get("action", ""))
+        try:
+            if action == "preview-restore":
+                upload = form.files.get("archive")
+                archive = await upload.read() if upload is not None and upload.size else b""
+                if not archive:
+                    raise LifecycleError("Upload a Chirp Space export ZIP.")
+                preview = lifecycle.preview_import(bytes(archive))
+                return lifecycle_page(request, error=None, preview=preview, deletion_report=None)
+            if action == "restore":
+                upload = form.files.get("archive")
+                archive = await upload.read() if upload is not None and upload.size else b""
+                if not archive:
+                    raise LifecycleError("Upload a Chirp Space export ZIP.")
+                preview = lifecycle.restore_archive(
+                    bytes(archive),
+                    confirmation=str(form.get("confirmation", "")),
+                    owner=owner,
+                    password=str(form.get("password", "")),
+                )
+                get_session()["space_message"] = (
+                    f"Restore applied for @{preview.handle}. Re-sign in if your session was reset."
+                )
+                return Redirect("/owner/lifecycle")
+            if action == "rotate-key":
+                key = lifecycle.rotate_signing_key(
+                    confirmation=str(form.get("confirmation", "")),
+                    owner=owner,
+                    password=str(form.get("password", "")),
+                )
+                get_session()["space_message"] = (
+                    f"Signing key rotated. Active key id {key.id}; retired public keys remain "
+                    "fetchable for 30 days."
+                )
+                return Redirect("/owner/lifecycle")
+            if action == "migrate-origin":
+                result = lifecycle.migrate_canonical_origin(
+                    confirmation=str(form.get("confirmation", "")),
+                    owner=owner,
+                    password=str(form.get("password", "")),
+                    acknowledge_federation_break=str(form.get("acknowledge_federation_break", ""))
+                    == "on",
+                )
+                get_session()["space_message"] = (
+                    f"Canonical origin migrated from {result.previous_origin} to "
+                    f"{result.new_origin}."
+                )
+                return Redirect("/owner/lifecycle")
+            if action == "delete-space":
+                report = lifecycle.delete_space(
+                    confirmation=str(form.get("confirmation", "")),
+                    owner=owner,
+                    password=str(form.get("password", "")),
+                    attempt_remote=str(form.get("attempt_remote", "on")) == "on",
+                )
+                return lifecycle_page(
+                    request,
+                    error=None,
+                    preview=None,
+                    deletion_report=report,
+                    message="Local Space deleted.",
+                )
+            raise LifecycleError("Unknown lifecycle action.")
+        except (LifecycleError, PermissionError, RuntimeError, ValueError) as exc:
+            return lifecycle_page(request, error=str(exc), preview=None, deletion_report=None)
 
     return app
 
