@@ -21,6 +21,9 @@
         <a href="/">Home</a>
         {% if state %}<a href="/archive">Archive</a><a href="/guestbook">Guestbook</a>{% endif %}
         {% if viewer %}
+          <a href="/home">Home feed</a>
+          <a href="/notifications"{% if notification_count is defined and notification_count %} aria-label="Notifications, {{ notification_count }} unread"{% endif %}>Notifications{% if notification_count is defined and notification_count %} ({{ notification_count }}){% endif %}</a>
+          <a href="/bookmarks">Bookmarks</a>
           <a href="/owner/content">Publish</a>
           <a href="/owner/connections">Connections</a>
           <a href="/owner/lifecycle">Lifecycle</a>

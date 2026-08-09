@@ -14,6 +14,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from chirp_space.models import (
+    Bookmark,
     Circle,
     ContentItem,
     Delivery,
@@ -22,8 +23,10 @@ from chirp_space.models import (
     FederationKey,
     GuestbookEntry,
     InboxReceipt,
+    Interaction,
     MediaAsset,
     MediaVariant,
+    Notification,
     OutboundActivity,
     Owner,
     PeerQueueStatus,
@@ -31,6 +34,7 @@ from chirp_space.models import (
     QueueHealth,
     Relationship,
     RemoteActor,
+    RemoteObject,
     SecurityEvent,
     SiteSettings,
     SiteState,
@@ -42,6 +46,10 @@ MAX_ACTIVE_DELIVERIES = 10_000
 LIFECYCLE_PURGE_STATEMENTS = (
     "DELETE FROM circle_members",
     "DELETE FROM circles",
+    "DELETE FROM interactions",
+    "DELETE FROM bookmarks",
+    "DELETE FROM notifications",
+    "DELETE FROM remote_objects",
     "DELETE FROM relationships",
     "DELETE FROM remote_actors",
     "DELETE FROM domain_blocks",
@@ -300,6 +308,52 @@ CREATE TABLE IF NOT EXISTS security_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_security_events_retention ON security_events(created_at);
+CREATE TABLE IF NOT EXISTS remote_objects (
+    id TEXT PRIMARY KEY,
+    actor_id TEXT NOT NULL REFERENCES remote_actors(id) ON DELETE CASCADE,
+    object_type TEXT NOT NULL CHECK (object_type IN ('Note', 'Article', 'Image', 'Tombstone')),
+    content_text TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    in_reply_to TEXT,
+    published_at TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    updated_at TEXT,
+    deleted_at TEXT,
+    unavailable INTEGER NOT NULL DEFAULT 0 CHECK (unavailable IN (0, 1)),
+    activity_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_remote_objects_feed
+    ON remote_objects(published_at DESC, actor_id ASC, id ASC);
+CREATE TABLE IF NOT EXISTS interactions (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('like', 'repost', 'reply')),
+    actor_id TEXT NOT NULL,
+    object_id TEXT NOT NULL,
+    reply_object_id TEXT,
+    created_at TEXT NOT NULL,
+    undone_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_interactions_active
+    ON interactions(kind, actor_id, object_id) WHERE undone_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_interactions_object ON interactions(object_id, kind, undone_at);
+CREATE TABLE IF NOT EXISTS bookmarks (
+    object_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notifications (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    actor_id TEXT,
+    object_id TEXT,
+    activity_id TEXT,
+    read_at TEXT,
+    suppressed INTEGER NOT NULL DEFAULT 0 CHECK (suppressed IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_activity
+    ON notifications(activity_id) WHERE activity_id IS NOT NULL;
 """
 
 POSTGRES_MIGRATION = (
@@ -541,6 +595,54 @@ POSTGRES_MIGRATION = (
     )""",
     """CREATE INDEX IF NOT EXISTS idx_security_events_retention
         ON security_events(created_at)""",
+    """CREATE TABLE IF NOT EXISTS remote_objects (
+        id TEXT PRIMARY KEY,
+        actor_id TEXT NOT NULL REFERENCES remote_actors(id) ON DELETE CASCADE,
+        object_type TEXT NOT NULL CHECK (object_type IN ('Note', 'Article', 'Image', 'Tombstone')),
+        content_text TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        in_reply_to TEXT,
+        published_at TIMESTAMPTZ NOT NULL,
+        received_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ,
+        deleted_at TIMESTAMPTZ,
+        unavailable BOOLEAN NOT NULL DEFAULT FALSE,
+        activity_id TEXT NOT NULL
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_remote_objects_feed
+        ON remote_objects(published_at DESC, actor_id ASC, id ASC)""",
+    """CREATE TABLE IF NOT EXISTS interactions (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('like', 'repost', 'reply')),
+        actor_id TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        reply_object_id TEXT,
+        created_at TIMESTAMPTZ NOT NULL,
+        undone_at TIMESTAMPTZ
+    )""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_interactions_active
+        ON interactions(kind, actor_id, object_id) WHERE undone_at IS NULL""",
+    """CREATE INDEX IF NOT EXISTS idx_interactions_object
+        ON interactions(object_id, kind, undone_at)""",
+    """CREATE TABLE IF NOT EXISTS bookmarks (
+        object_id TEXT PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS notifications (
+        id UUID PRIMARY KEY,
+        kind TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        actor_id TEXT,
+        object_id TEXT,
+        activity_id TEXT,
+        read_at TIMESTAMPTZ,
+        suppressed BOOLEAN NOT NULL DEFAULT FALSE
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_notifications_created
+        ON notifications(created_at DESC, id DESC)""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_activity
+        ON notifications(activity_id) WHERE activity_id IS NOT NULL""",
 )
 
 RELATIONSHIP_SELECT = """SELECT
@@ -667,6 +769,39 @@ class Store(Protocol):
     def security_events(self, *, limit: int = 100) -> tuple[SecurityEvent, ...]: ...
     def purge_security_events(self, *, before: datetime) -> int: ...
     def peer_queue_statuses(self) -> tuple[PeerQueueStatus, ...]: ...
+    def upsert_remote_object(self, obj: RemoteObject) -> RemoteObject: ...
+    def remote_object(self, object_id: str) -> RemoteObject | None: ...
+    def remote_objects(self, *, limit: int = 500) -> tuple[RemoteObject, ...]: ...
+    def touch_remote_actor(self, actor_id: str, *, now: datetime) -> None: ...
+    def save_interaction(self, interaction: Interaction) -> Interaction: ...
+    def active_interaction(
+        self, *, kind: str, actor_id: str, object_id: str
+    ) -> Interaction | None: ...
+    def interaction_by_activity(self, activity_id: str) -> Interaction | None: ...
+    def interactions(
+        self,
+        *,
+        kind: str | None = None,
+        actor_id: str | None = None,
+        active_only: bool = False,
+        limit: int = 500,
+    ) -> tuple[Interaction, ...]: ...
+    def interaction_counts(self, kind: str) -> dict[str, int]: ...
+    def save_bookmark(self, bookmark: Bookmark) -> Bookmark: ...
+    def delete_bookmark(self, object_id: str) -> None: ...
+    def bookmarks(self) -> tuple[Bookmark, ...]: ...
+    def save_notification(self, notification: Notification) -> Notification: ...
+    def notifications(
+        self, *, unread_only: bool = False, limit: int = 50
+    ) -> tuple[Notification, ...]: ...
+    def unread_notification_count(self) -> int: ...
+    def notification_for_activity(self, activity_id: str) -> Notification | None: ...
+    def mark_notification_read(
+        self, notification_id: str, *, read_at: datetime
+    ) -> Notification: ...
+    def mark_all_notifications_read(self, *, read_at: datetime) -> int: ...
+    def delete_notification(self, notification_id: str) -> None: ...
+    def delivery_status_by_object(self) -> dict[str, str]: ...
 
     def unused_recovery_code_hashes(self, owner_id: str) -> tuple[str, ...]: ...
     def federation_keys(self) -> tuple[FederationKey, ...]: ...
@@ -734,6 +869,10 @@ class SQLiteStore:
             self._connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (6, ?, ?)",
                 ("federation safety controls limits and diagnostics", _iso(now)),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (7, ?, ?)",
+                ("chronological feed interactions and notifications", _iso(now)),
             )
 
     def close(self) -> None:
@@ -2248,6 +2387,66 @@ class SQLiteStore:
                             VALUES (?, ?)""",
                             (circle.id, actor_id),
                         )
+                for obj in snapshot.remote_objects:
+                    self._connection.execute(
+                        """INSERT INTO remote_objects(
+                            id, actor_id, object_type, content_text, summary, in_reply_to,
+                            published_at, received_at, updated_at, deleted_at, unavailable,
+                            activity_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            obj.id,
+                            obj.actor_id,
+                            obj.object_type,
+                            obj.content_text,
+                            obj.summary,
+                            obj.in_reply_to,
+                            _iso(obj.published_at),
+                            _iso(obj.received_at),
+                            _iso(obj.updated_at) if obj.updated_at else None,
+                            _iso(obj.deleted_at) if obj.deleted_at else None,
+                            int(obj.unavailable),
+                            obj.activity_id,
+                        ),
+                    )
+                for item in snapshot.interactions:
+                    self._connection.execute(
+                        """INSERT INTO interactions(
+                            id, kind, actor_id, object_id, reply_object_id, created_at, undone_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            item.id,
+                            item.kind,
+                            item.actor_id,
+                            item.object_id,
+                            item.reply_object_id,
+                            _iso(item.created_at),
+                            _iso(item.undone_at) if item.undone_at else None,
+                        ),
+                    )
+                for bookmark in snapshot.bookmarks:
+                    self._connection.execute(
+                        "INSERT INTO bookmarks(object_id, created_at) VALUES (?, ?)",
+                        (bookmark.object_id, _iso(bookmark.created_at)),
+                    )
+                for note in snapshot.notifications:
+                    self._connection.execute(
+                        """INSERT INTO notifications(
+                            id, kind, summary, actor_id, object_id, activity_id,
+                            created_at, read_at, suppressed
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            note.id,
+                            note.kind,
+                            note.summary,
+                            note.actor_id,
+                            note.object_id,
+                            note.activity_id,
+                            _iso(note.created_at),
+                            _iso(note.read_at) if note.read_at else None,
+                            int(note.suppressed),
+                        ),
+                    )
                 now = datetime.now(UTC)
                 self._connection.execute(
                     """UPDATE federation_controls
@@ -2260,6 +2459,284 @@ class SQLiteStore:
             except Exception:
                 self._connection.execute("ROLLBACK")
                 raise
+
+    def upsert_remote_object(self, obj: RemoteObject) -> RemoteObject:
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO remote_objects(
+                    id, actor_id, object_type, content_text, summary, in_reply_to,
+                    published_at, received_at, updated_at, deleted_at, unavailable, activity_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    object_type = excluded.object_type,
+                    content_text = excluded.content_text,
+                    summary = excluded.summary,
+                    in_reply_to = excluded.in_reply_to,
+                    updated_at = excluded.updated_at,
+                    deleted_at = excluded.deleted_at,
+                    unavailable = excluded.unavailable,
+                    activity_id = excluded.activity_id
+                """,
+                (
+                    obj.id,
+                    obj.actor_id,
+                    obj.object_type,
+                    obj.content_text,
+                    obj.summary,
+                    obj.in_reply_to,
+                    _iso(obj.published_at),
+                    _iso(obj.received_at),
+                    _iso(obj.updated_at) if obj.updated_at else None,
+                    _iso(obj.deleted_at) if obj.deleted_at else None,
+                    int(obj.unavailable),
+                    obj.activity_id,
+                ),
+            )
+        result = self.remote_object(obj.id)
+        if result is None:
+            raise RuntimeError("Remote object disappeared after upsert.")
+        return result
+
+    def remote_object(self, object_id: str) -> RemoteObject | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM remote_objects WHERE id = ?", (object_id,)
+            ).fetchone()
+        return _remote_object_from_mapping(row) if row is not None else None
+
+    def remote_objects(self, *, limit: int = 500) -> tuple[RemoteObject, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM remote_objects
+                ORDER BY published_at DESC, actor_id ASC, id ASC LIMIT ?""",
+                (max(1, min(limit, 1_000)),),
+            ).fetchall()
+        return tuple(_remote_object_from_mapping(row) for row in rows)
+
+    def touch_remote_actor(self, actor_id: str, *, now: datetime) -> None:
+        with self._lock:
+            self._connection.execute(
+                "UPDATE remote_actors SET last_contact_at = ? WHERE id = ?",
+                (_iso(now), actor_id),
+            )
+
+    def save_interaction(self, interaction: Interaction) -> Interaction:
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO interactions(
+                    id, kind, actor_id, object_id, reply_object_id, created_at, undone_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    undone_at = excluded.undone_at,
+                    reply_object_id = excluded.reply_object_id
+                """,
+                (
+                    interaction.id,
+                    interaction.kind,
+                    interaction.actor_id,
+                    interaction.object_id,
+                    interaction.reply_object_id,
+                    _iso(interaction.created_at),
+                    _iso(interaction.undone_at) if interaction.undone_at else None,
+                ),
+            )
+        return interaction
+
+    def active_interaction(self, *, kind: str, actor_id: str, object_id: str) -> Interaction | None:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT * FROM interactions
+                WHERE kind = ? AND actor_id = ? AND object_id = ? AND undone_at IS NULL""",
+                (kind, actor_id, object_id),
+            ).fetchone()
+        return _interaction_from_mapping(row) if row is not None else None
+
+    def interaction_by_activity(self, activity_id: str) -> Interaction | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM interactions WHERE id = ?", (activity_id,)
+            ).fetchone()
+        return _interaction_from_mapping(row) if row is not None else None
+
+    def interactions(
+        self,
+        *,
+        kind: str | None = None,
+        actor_id: str | None = None,
+        active_only: bool = False,
+        limit: int = 500,
+    ) -> tuple[Interaction, ...]:
+        bound = max(1, min(limit, 1_000))
+        with self._lock:
+            if kind is not None and actor_id is not None and active_only:
+                rows = self._connection.execute(
+                    """SELECT * FROM interactions
+                    WHERE kind = ? AND actor_id = ? AND undone_at IS NULL
+                    ORDER BY created_at DESC, id DESC LIMIT ?""",
+                    (kind, actor_id, bound),
+                ).fetchall()
+            elif kind is not None and active_only:
+                rows = self._connection.execute(
+                    """SELECT * FROM interactions
+                    WHERE kind = ? AND undone_at IS NULL
+                    ORDER BY created_at DESC, id DESC LIMIT ?""",
+                    (kind, bound),
+                ).fetchall()
+            elif kind is not None and actor_id is not None:
+                rows = self._connection.execute(
+                    """SELECT * FROM interactions
+                    WHERE kind = ? AND actor_id = ?
+                    ORDER BY created_at DESC, id DESC LIMIT ?""",
+                    (kind, actor_id, bound),
+                ).fetchall()
+            elif kind is not None:
+                rows = self._connection.execute(
+                    """SELECT * FROM interactions WHERE kind = ?
+                    ORDER BY created_at DESC, id DESC LIMIT ?""",
+                    (kind, bound),
+                ).fetchall()
+            elif actor_id is not None and active_only:
+                rows = self._connection.execute(
+                    """SELECT * FROM interactions
+                    WHERE actor_id = ? AND undone_at IS NULL
+                    ORDER BY created_at DESC, id DESC LIMIT ?""",
+                    (actor_id, bound),
+                ).fetchall()
+            elif actor_id is not None:
+                rows = self._connection.execute(
+                    """SELECT * FROM interactions WHERE actor_id = ?
+                    ORDER BY created_at DESC, id DESC LIMIT ?""",
+                    (actor_id, bound),
+                ).fetchall()
+            elif active_only:
+                rows = self._connection.execute(
+                    """SELECT * FROM interactions WHERE undone_at IS NULL
+                    ORDER BY created_at DESC, id DESC LIMIT ?""",
+                    (bound,),
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    """SELECT * FROM interactions
+                    ORDER BY created_at DESC, id DESC LIMIT ?""",
+                    (bound,),
+                ).fetchall()
+        return tuple(_interaction_from_mapping(row) for row in rows)
+
+    def interaction_counts(self, kind: str) -> dict[str, int]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT object_id, COUNT(*) FROM interactions
+                WHERE kind = ? AND undone_at IS NULL GROUP BY object_id""",
+                (kind,),
+            ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def save_bookmark(self, bookmark: Bookmark) -> Bookmark:
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO bookmarks(object_id, created_at) VALUES (?, ?)
+                ON CONFLICT(object_id) DO NOTHING""",
+                (bookmark.object_id, _iso(bookmark.created_at)),
+            )
+        return bookmark
+
+    def delete_bookmark(self, object_id: str) -> None:
+        with self._lock:
+            self._connection.execute("DELETE FROM bookmarks WHERE object_id = ?", (object_id,))
+
+    def bookmarks(self) -> tuple[Bookmark, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT object_id, created_at FROM bookmarks ORDER BY created_at DESC"
+            ).fetchall()
+        return tuple(Bookmark(str(row[0]), _datetime(row[1])) for row in rows)
+
+    def save_notification(self, notification: Notification) -> Notification:
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO notifications(
+                    id, kind, summary, created_at, actor_id, object_id, activity_id,
+                    read_at, suppressed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING""",
+                (
+                    notification.id,
+                    notification.kind,
+                    notification.summary,
+                    _iso(notification.created_at),
+                    notification.actor_id,
+                    notification.object_id,
+                    notification.activity_id,
+                    _iso(notification.read_at) if notification.read_at else None,
+                    int(notification.suppressed),
+                ),
+            )
+        return notification
+
+    def notifications(
+        self, *, unread_only: bool = False, limit: int = 50
+    ) -> tuple[Notification, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM notifications
+                WHERE suppressed = 0 AND (? = 0 OR read_at IS NULL)
+                ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (int(unread_only), max(1, min(limit, 200))),
+            ).fetchall()
+        return tuple(_notification_from_mapping(row) for row in rows)
+
+    def unread_notification_count(self) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT COUNT(*) FROM notifications
+                WHERE suppressed = 0 AND read_at IS NULL"""
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def notification_for_activity(self, activity_id: str) -> Notification | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM notifications WHERE activity_id = ?", (activity_id,)
+            ).fetchone()
+        return _notification_from_mapping(row) if row is not None else None
+
+    def mark_notification_read(self, notification_id: str, *, read_at: datetime) -> Notification:
+        with self._lock:
+            row = self._connection.execute(
+                """UPDATE notifications SET read_at = ? WHERE id = ? RETURNING *""",
+                (_iso(read_at), notification_id),
+            ).fetchone()
+        if row is None:
+            raise LookupError("Notification not found.")
+        return _notification_from_mapping(row)
+
+    def mark_all_notifications_read(self, *, read_at: datetime) -> int:
+        with self._lock:
+            result = self._connection.execute(
+                "UPDATE notifications SET read_at = ? WHERE read_at IS NULL AND suppressed = 0",
+                (_iso(read_at),),
+            )
+        return int(result.rowcount)
+
+    def delete_notification(self, notification_id: str) -> None:
+        with self._lock:
+            self._connection.execute("DELETE FROM notifications WHERE id = ?", (notification_id,))
+
+    def delivery_status_by_object(self) -> dict[str, str]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT a.object_id, d.status
+                FROM outbound_activities a
+                JOIN deliveries d ON d.activity_id = a.id
+                WHERE a.object_id IS NOT NULL
+                ORDER BY d.updated_at DESC"""
+            ).fetchall()
+        statuses: dict[str, str] = {}
+        for object_id, status in rows:
+            key = str(object_id)
+            if key not in statuses:
+                statuses[key] = str(status)
+        return statuses
 
 
 class PostgresStore:
@@ -2319,6 +2796,11 @@ class PostgresStore:
                 """INSERT INTO schema_migrations(version, name) VALUES (6, %s)
                 ON CONFLICT (version) DO NOTHING""",
                 ("federation safety controls limits and diagnostics",),
+            )
+            connection.execute(
+                """INSERT INTO schema_migrations(version, name) VALUES (7, %s)
+                ON CONFLICT (version) DO NOTHING""",
+                ("chronological feed interactions and notifications",),
             )
 
     def close(self) -> None:
@@ -3710,12 +4192,366 @@ class PostgresStore:
                         ON CONFLICT DO NOTHING""",
                         (circle.id, actor_id),
                     )
+            for obj in snapshot.remote_objects:
+                connection.execute(
+                    """INSERT INTO remote_objects(
+                        id, actor_id, object_type, content_text, summary, in_reply_to,
+                        published_at, received_at, updated_at, deleted_at, unavailable,
+                        activity_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        obj.id,
+                        obj.actor_id,
+                        obj.object_type,
+                        obj.content_text,
+                        obj.summary,
+                        obj.in_reply_to,
+                        obj.published_at,
+                        obj.received_at,
+                        obj.updated_at,
+                        obj.deleted_at,
+                        obj.unavailable,
+                        obj.activity_id,
+                    ),
+                )
+            for item in snapshot.interactions:
+                connection.execute(
+                    """INSERT INTO interactions(
+                        id, kind, actor_id, object_id, reply_object_id, created_at, undone_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        item.id,
+                        item.kind,
+                        item.actor_id,
+                        item.object_id,
+                        item.reply_object_id,
+                        item.created_at,
+                        item.undone_at,
+                    ),
+                )
+            for bookmark in snapshot.bookmarks:
+                connection.execute(
+                    "INSERT INTO bookmarks(object_id, created_at) VALUES (%s, %s)",
+                    (bookmark.object_id, bookmark.created_at),
+                )
+            for note in snapshot.notifications:
+                connection.execute(
+                    """INSERT INTO notifications(
+                        id, kind, summary, actor_id, object_id, activity_id,
+                        created_at, read_at, suppressed
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        note.id,
+                        note.kind,
+                        note.summary,
+                        note.actor_id,
+                        note.object_id,
+                        note.activity_id,
+                        note.created_at,
+                        note.read_at,
+                        note.suppressed,
+                    ),
+                )
             connection.execute(
                 """UPDATE federation_controls
                 SET inbound_paused = FALSE, outbound_paused = FALSE, reason = '',
                     revision = 1, updated_at = now()
                 WHERE singleton_id = 1"""
             )
+
+    def upsert_remote_object(self, obj: RemoteObject) -> RemoteObject:
+        with self._pool.connection() as connection:
+            connection.execute(
+                """INSERT INTO remote_objects(
+                    id, actor_id, object_type, content_text, summary, in_reply_to,
+                    published_at, received_at, updated_at, deleted_at, unavailable, activity_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(id) DO UPDATE SET
+                    object_type = EXCLUDED.object_type,
+                    content_text = EXCLUDED.content_text,
+                    summary = EXCLUDED.summary,
+                    in_reply_to = EXCLUDED.in_reply_to,
+                    updated_at = EXCLUDED.updated_at,
+                    deleted_at = EXCLUDED.deleted_at,
+                    unavailable = EXCLUDED.unavailable,
+                    activity_id = EXCLUDED.activity_id
+                """,
+                (
+                    obj.id,
+                    obj.actor_id,
+                    obj.object_type,
+                    obj.content_text,
+                    obj.summary,
+                    obj.in_reply_to,
+                    obj.published_at,
+                    obj.received_at,
+                    obj.updated_at,
+                    obj.deleted_at,
+                    obj.unavailable,
+                    obj.activity_id,
+                ),
+            )
+        result = self.remote_object(obj.id)
+        if result is None:
+            raise RuntimeError("Remote object disappeared after upsert.")
+        return result
+
+    def remote_object(self, object_id: str) -> RemoteObject | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """SELECT id, actor_id, object_type, content_text, summary, in_reply_to,
+                    published_at, received_at, updated_at, deleted_at, unavailable, activity_id
+                FROM remote_objects WHERE id = %s""",
+                (object_id,),
+            ).fetchone()
+        return _remote_object_from_sequence(row) if row is not None else None
+
+    def remote_objects(self, *, limit: int = 500) -> tuple[RemoteObject, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT id, actor_id, object_type, content_text, summary, in_reply_to,
+                    published_at, received_at, updated_at, deleted_at, unavailable, activity_id
+                FROM remote_objects
+                ORDER BY published_at DESC, actor_id ASC, id ASC LIMIT %s""",
+                (max(1, min(limit, 1_000)),),
+            ).fetchall()
+        return tuple(_remote_object_from_sequence(row) for row in rows)
+
+    def touch_remote_actor(self, actor_id: str, *, now: datetime) -> None:
+        with self._pool.connection() as connection:
+            connection.execute(
+                "UPDATE remote_actors SET last_contact_at = %s WHERE id = %s",
+                (now, actor_id),
+            )
+
+    def save_interaction(self, interaction: Interaction) -> Interaction:
+        with self._pool.connection() as connection:
+            connection.execute(
+                """INSERT INTO interactions(
+                    id, kind, actor_id, object_id, reply_object_id, created_at, undone_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(id) DO UPDATE SET
+                    undone_at = EXCLUDED.undone_at,
+                    reply_object_id = EXCLUDED.reply_object_id
+                """,
+                (
+                    interaction.id,
+                    interaction.kind,
+                    interaction.actor_id,
+                    interaction.object_id,
+                    interaction.reply_object_id,
+                    interaction.created_at,
+                    interaction.undone_at,
+                ),
+            )
+        return interaction
+
+    def active_interaction(self, *, kind: str, actor_id: str, object_id: str) -> Interaction | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """SELECT id, kind, actor_id, object_id, reply_object_id, created_at, undone_at
+                FROM interactions
+                WHERE kind = %s AND actor_id = %s AND object_id = %s AND undone_at IS NULL""",
+                (kind, actor_id, object_id),
+            ).fetchone()
+        return _interaction_from_sequence(row) if row is not None else None
+
+    def interaction_by_activity(self, activity_id: str) -> Interaction | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """SELECT id, kind, actor_id, object_id, reply_object_id, created_at, undone_at
+                FROM interactions WHERE id = %s""",
+                (activity_id,),
+            ).fetchone()
+        return _interaction_from_sequence(row) if row is not None else None
+
+    def interactions(
+        self,
+        *,
+        kind: str | None = None,
+        actor_id: str | None = None,
+        active_only: bool = False,
+        limit: int = 500,
+    ) -> tuple[Interaction, ...]:
+        bound = max(1, min(limit, 1_000))
+        select = (
+            "SELECT id, kind, actor_id, object_id, reply_object_id, created_at, undone_at "
+            "FROM interactions"
+        )
+        with self._pool.connection() as connection:
+            if kind is not None and actor_id is not None and active_only:
+                rows = connection.execute(
+                    select
+                    + " WHERE kind = %s AND actor_id = %s AND undone_at IS NULL"
+                    + " ORDER BY created_at DESC, id DESC LIMIT %s",
+                    (kind, actor_id, bound),
+                ).fetchall()
+            elif kind is not None and active_only:
+                rows = connection.execute(
+                    select
+                    + " WHERE kind = %s AND undone_at IS NULL"
+                    + " ORDER BY created_at DESC, id DESC LIMIT %s",
+                    (kind, bound),
+                ).fetchall()
+            elif kind is not None and actor_id is not None:
+                rows = connection.execute(
+                    select
+                    + " WHERE kind = %s AND actor_id = %s"
+                    + " ORDER BY created_at DESC, id DESC LIMIT %s",
+                    (kind, actor_id, bound),
+                ).fetchall()
+            elif kind is not None:
+                rows = connection.execute(
+                    select + " WHERE kind = %s ORDER BY created_at DESC, id DESC LIMIT %s",
+                    (kind, bound),
+                ).fetchall()
+            elif actor_id is not None and active_only:
+                rows = connection.execute(
+                    select
+                    + " WHERE actor_id = %s AND undone_at IS NULL"
+                    + " ORDER BY created_at DESC, id DESC LIMIT %s",
+                    (actor_id, bound),
+                ).fetchall()
+            elif actor_id is not None:
+                rows = connection.execute(
+                    select + " WHERE actor_id = %s ORDER BY created_at DESC, id DESC LIMIT %s",
+                    (actor_id, bound),
+                ).fetchall()
+            elif active_only:
+                rows = connection.execute(
+                    select + " WHERE undone_at IS NULL ORDER BY created_at DESC, id DESC LIMIT %s",
+                    (bound,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    select + " ORDER BY created_at DESC, id DESC LIMIT %s",
+                    (bound,),
+                ).fetchall()
+        return tuple(_interaction_from_sequence(row) for row in rows)
+
+    def interaction_counts(self, kind: str) -> dict[str, int]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT object_id, COUNT(*) FROM interactions
+                WHERE kind = %s AND undone_at IS NULL GROUP BY object_id""",
+                (kind,),
+            ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def save_bookmark(self, bookmark: Bookmark) -> Bookmark:
+        with self._pool.connection() as connection:
+            connection.execute(
+                """INSERT INTO bookmarks(object_id, created_at) VALUES (%s, %s)
+                ON CONFLICT(object_id) DO NOTHING""",
+                (bookmark.object_id, bookmark.created_at),
+            )
+        return bookmark
+
+    def delete_bookmark(self, object_id: str) -> None:
+        with self._pool.connection() as connection:
+            connection.execute("DELETE FROM bookmarks WHERE object_id = %s", (object_id,))
+
+    def bookmarks(self) -> tuple[Bookmark, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                "SELECT object_id, created_at FROM bookmarks ORDER BY created_at DESC"
+            ).fetchall()
+        return tuple(Bookmark(str(row[0]), _datetime(row[1])) for row in rows)
+
+    def save_notification(self, notification: Notification) -> Notification:
+        with self._pool.connection() as connection:
+            connection.execute(
+                """INSERT INTO notifications(
+                    id, kind, summary, created_at, actor_id, object_id, activity_id,
+                    read_at, suppressed
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(id) DO NOTHING""",
+                (
+                    notification.id,
+                    notification.kind,
+                    notification.summary,
+                    notification.created_at,
+                    notification.actor_id,
+                    notification.object_id,
+                    notification.activity_id,
+                    notification.read_at,
+                    notification.suppressed,
+                ),
+            )
+        return notification
+
+    def notifications(
+        self, *, unread_only: bool = False, limit: int = 50
+    ) -> tuple[Notification, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT id, kind, summary, created_at, actor_id, object_id, activity_id,
+                    read_at, suppressed
+                FROM notifications
+                WHERE suppressed = FALSE AND (%s = FALSE OR read_at IS NULL)
+                ORDER BY created_at DESC, id DESC LIMIT %s""",
+                (unread_only, max(1, min(limit, 200))),
+            ).fetchall()
+        return tuple(_notification_from_sequence(row) for row in rows)
+
+    def unread_notification_count(self) -> int:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) FROM notifications
+                WHERE suppressed = FALSE AND read_at IS NULL"""
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def notification_for_activity(self, activity_id: str) -> Notification | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """SELECT id, kind, summary, created_at, actor_id, object_id, activity_id,
+                    read_at, suppressed
+                FROM notifications WHERE activity_id = %s""",
+                (activity_id,),
+            ).fetchone()
+        return _notification_from_sequence(row) if row is not None else None
+
+    def mark_notification_read(self, notification_id: str, *, read_at: datetime) -> Notification:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """UPDATE notifications SET read_at = %s WHERE id = %s
+                RETURNING id, kind, summary, created_at, actor_id, object_id, activity_id,
+                    read_at, suppressed""",
+                (read_at, notification_id),
+            ).fetchone()
+        if row is None:
+            raise LookupError("Notification not found.")
+        return _notification_from_sequence(row)
+
+    def mark_all_notifications_read(self, *, read_at: datetime) -> int:
+        with self._pool.connection() as connection:
+            result = connection.execute(
+                """UPDATE notifications SET read_at = %s
+                WHERE read_at IS NULL AND suppressed = FALSE""",
+                (read_at,),
+            )
+        return int(result.rowcount or 0)
+
+    def delete_notification(self, notification_id: str) -> None:
+        with self._pool.connection() as connection:
+            connection.execute("DELETE FROM notifications WHERE id = %s", (notification_id,))
+
+    def delivery_status_by_object(self) -> dict[str, str]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT a.object_id, d.status
+                FROM outbound_activities a
+                JOIN deliveries d ON d.activity_id = a.id
+                WHERE a.object_id IS NOT NULL
+                ORDER BY d.updated_at DESC"""
+            ).fetchall()
+        statuses: dict[str, str] = {}
+        for object_id, status in rows:
+            key = str(object_id)
+            if key not in statuses:
+                statuses[key] = str(status)
+        return statuses
 
 
 def store_from_url(database_url: str) -> Store:
@@ -4256,4 +5092,90 @@ def _guestbook_from_sequence(row: Sequence[object]) -> GuestbookEntry:
         submission_hash=str(row[6]),
         created_at=_datetime(row[7]),
         moderated_at=_datetime(row[8]) if row[8] else None,
+    )
+
+
+def _remote_object_from_mapping(row: sqlite3.Row) -> RemoteObject:
+    return RemoteObject(
+        id=str(row["id"]),
+        actor_id=str(row["actor_id"]),
+        object_type=str(row["object_type"]),
+        content_text=str(row["content_text"]),
+        summary=str(row["summary"]),
+        in_reply_to=str(row["in_reply_to"]) if row["in_reply_to"] else None,
+        published_at=_datetime(row["published_at"]),
+        received_at=_datetime(row["received_at"]),
+        updated_at=_datetime(row["updated_at"]) if row["updated_at"] else None,
+        deleted_at=_datetime(row["deleted_at"]) if row["deleted_at"] else None,
+        unavailable=bool(row["unavailable"]),
+        activity_id=str(row["activity_id"]),
+    )
+
+
+def _remote_object_from_sequence(row: Sequence[object]) -> RemoteObject:
+    return RemoteObject(
+        id=str(row[0]),
+        actor_id=str(row[1]),
+        object_type=str(row[2]),
+        content_text=str(row[3]),
+        summary=str(row[4]),
+        in_reply_to=str(row[5]) if row[5] else None,
+        published_at=_datetime(row[6]),
+        received_at=_datetime(row[7]),
+        updated_at=_datetime(row[8]) if row[8] else None,
+        deleted_at=_datetime(row[9]) if row[9] else None,
+        unavailable=bool(row[10]),
+        activity_id=str(row[11]),
+    )
+
+
+def _interaction_from_mapping(row: sqlite3.Row) -> Interaction:
+    return Interaction(
+        id=str(row["id"]),
+        kind=str(row["kind"]),
+        actor_id=str(row["actor_id"]),
+        object_id=str(row["object_id"]),
+        created_at=_datetime(row["created_at"]),
+        reply_object_id=str(row["reply_object_id"]) if row["reply_object_id"] else None,
+        undone_at=_datetime(row["undone_at"]) if row["undone_at"] else None,
+    )
+
+
+def _interaction_from_sequence(row: Sequence[object]) -> Interaction:
+    return Interaction(
+        id=str(row[0]),
+        kind=str(row[1]),
+        actor_id=str(row[2]),
+        object_id=str(row[3]),
+        created_at=_datetime(row[5]),
+        reply_object_id=str(row[4]) if row[4] else None,
+        undone_at=_datetime(row[6]) if row[6] else None,
+    )
+
+
+def _notification_from_mapping(row: sqlite3.Row) -> Notification:
+    return Notification(
+        id=str(row["id"]),
+        kind=str(row["kind"]),
+        summary=str(row["summary"]),
+        created_at=_datetime(row["created_at"]),
+        actor_id=str(row["actor_id"]) if row["actor_id"] else None,
+        object_id=str(row["object_id"]) if row["object_id"] else None,
+        activity_id=str(row["activity_id"]) if row["activity_id"] else None,
+        read_at=_datetime(row["read_at"]) if row["read_at"] else None,
+        suppressed=bool(row["suppressed"]),
+    )
+
+
+def _notification_from_sequence(row: Sequence[object]) -> Notification:
+    return Notification(
+        id=str(row[0]),
+        kind=str(row[1]),
+        summary=str(row[2]),
+        created_at=_datetime(row[3]),
+        actor_id=str(row[4]) if row[4] else None,
+        object_id=str(row[5]) if row[5] else None,
+        activity_id=str(row[6]) if row[6] else None,
+        read_at=_datetime(row[7]) if row[7] else None,
+        suppressed=bool(row[8]),
     )

@@ -21,16 +21,20 @@ from chirp_space.config import SpaceConfig, normalize_origin
 from chirp_space.content import ObjectStorage
 from chirp_space.federation import FederationService
 from chirp_space.models import (
+    Bookmark,
     Circle,
     ContentItem,
     FederationKey,
     GuestbookEntry,
+    Interaction,
     MediaAsset,
     MediaVariant,
+    Notification,
     Owner,
     ProfileModule,
     Relationship,
     RemoteActor,
+    RemoteObject,
     SiteSettings,
     SiteState,
     SpaceDataSnapshot,
@@ -138,6 +142,10 @@ class SpaceLifecycleService:
             content_items=self.store.export_content_items(),
             media_assets=self.store.export_media_assets(),
             guestbook_entries=self.store.guestbook_entries(public_only=False),
+            remote_objects=self.store.remote_objects(limit=10_000),
+            interactions=self.store.interactions(limit=10_000),
+            bookmarks=self.store.bookmarks(),
+            notifications=self.store.notifications(limit=10_000),
         )
 
     def export_archive(self) -> bytes:
@@ -643,6 +651,13 @@ def _snapshot_to_json(
         "content_items": [_content_to_json(item) for item in snapshot.content_items],
         "media_assets": [_media_to_json(item) for item in snapshot.media_assets],
         "guestbook_entries": [_guestbook_to_json(item) for item in snapshot.guestbook_entries],
+        "remote_objects": [_remote_object_to_json(item) for item in snapshot.remote_objects],
+        "interactions": [_interaction_to_json(item) for item in snapshot.interactions],
+        "bookmarks": [
+            {"object_id": item.object_id, "created_at": _iso(item.created_at)}
+            for item in snapshot.bookmarks
+        ],
+        "notifications": [_notification_to_json(item) for item in snapshot.notifications],
         "media_manifest": [
             {
                 "object_key": ref.object_key,
@@ -730,6 +745,29 @@ def _snapshot_from_json(payload: Mapping[str, Any]) -> SpaceDataSnapshot:
         _content_from_json(item, media_by_id) for item in _list(payload, "content_items")
     )
     guestbook = tuple(_guestbook_from_json(item) for item in _list(payload, "guestbook_entries"))
+    remote_objects = (
+        tuple(_remote_object_from_json(item) for item in _list(payload, "remote_objects"))
+        if "remote_objects" in payload
+        else ()
+    )
+    interactions = (
+        tuple(_interaction_from_json(item) for item in _list(payload, "interactions"))
+        if "interactions" in payload
+        else ()
+    )
+    bookmarks = (
+        tuple(
+            Bookmark(object_id=str(item["object_id"]), created_at=_parse_dt(item["created_at"]))
+            for item in _list(payload, "bookmarks")
+        )
+        if "bookmarks" in payload
+        else ()
+    )
+    notifications = (
+        tuple(_notification_from_json(item) for item in _list(payload, "notifications"))
+        if "notifications" in payload
+        else ()
+    )
     return SpaceDataSnapshot(
         owner=owner,
         settings=settings,
@@ -742,6 +780,10 @@ def _snapshot_from_json(payload: Mapping[str, Any]) -> SpaceDataSnapshot:
         content_items=content_items,
         media_assets=media_assets,
         guestbook_entries=guestbook,
+        remote_objects=remote_objects,
+        interactions=interactions,
+        bookmarks=bookmarks,
+        notifications=notifications,
     )
 
 
@@ -935,6 +977,92 @@ def _guestbook_from_json(raw: Mapping[str, Any]) -> GuestbookEntry:
         submission_hash=str(raw["submission_hash"]),
         created_at=_parse_dt(raw["created_at"]),
         moderated_at=_parse_dt(raw["moderated_at"]) if raw.get("moderated_at") else None,
+    )
+
+
+def _remote_object_to_json(obj: RemoteObject) -> dict[str, Any]:
+    return {
+        "id": obj.id,
+        "actor_id": obj.actor_id,
+        "object_type": obj.object_type,
+        "content_text": obj.content_text,
+        "summary": obj.summary,
+        "in_reply_to": obj.in_reply_to,
+        "published_at": _iso(obj.published_at),
+        "received_at": _iso(obj.received_at),
+        "updated_at": _iso(obj.updated_at) if obj.updated_at else None,
+        "deleted_at": _iso(obj.deleted_at) if obj.deleted_at else None,
+        "unavailable": obj.unavailable,
+        "activity_id": obj.activity_id,
+    }
+
+
+def _remote_object_from_json(raw: Mapping[str, Any]) -> RemoteObject:
+    return RemoteObject(
+        id=str(raw["id"]),
+        actor_id=str(raw["actor_id"]),
+        object_type=str(raw["object_type"]),
+        content_text=str(raw["content_text"]),
+        summary=str(raw["summary"]),
+        in_reply_to=str(raw["in_reply_to"]) if raw.get("in_reply_to") else None,
+        published_at=_parse_dt(raw["published_at"]),
+        received_at=_parse_dt(raw["received_at"]),
+        updated_at=_parse_dt(raw["updated_at"]) if raw.get("updated_at") else None,
+        deleted_at=_parse_dt(raw["deleted_at"]) if raw.get("deleted_at") else None,
+        unavailable=bool(raw.get("unavailable", False)),
+        activity_id=str(raw.get("activity_id", "")),
+    )
+
+
+def _interaction_to_json(item: Interaction) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "kind": item.kind,
+        "actor_id": item.actor_id,
+        "object_id": item.object_id,
+        "created_at": _iso(item.created_at),
+        "reply_object_id": item.reply_object_id,
+        "undone_at": _iso(item.undone_at) if item.undone_at else None,
+    }
+
+
+def _interaction_from_json(raw: Mapping[str, Any]) -> Interaction:
+    return Interaction(
+        id=str(raw["id"]),
+        kind=str(raw["kind"]),
+        actor_id=str(raw["actor_id"]),
+        object_id=str(raw["object_id"]),
+        created_at=_parse_dt(raw["created_at"]),
+        reply_object_id=str(raw["reply_object_id"]) if raw.get("reply_object_id") else None,
+        undone_at=_parse_dt(raw["undone_at"]) if raw.get("undone_at") else None,
+    )
+
+
+def _notification_to_json(item: Notification) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "kind": item.kind,
+        "summary": item.summary,
+        "created_at": _iso(item.created_at),
+        "actor_id": item.actor_id,
+        "object_id": item.object_id,
+        "activity_id": item.activity_id,
+        "read_at": _iso(item.read_at) if item.read_at else None,
+        "suppressed": item.suppressed,
+    }
+
+
+def _notification_from_json(raw: Mapping[str, Any]) -> Notification:
+    return Notification(
+        id=_uuid_text(raw["id"], "notification.id"),
+        kind=str(raw["kind"]),
+        summary=str(raw["summary"]),
+        created_at=_parse_dt(raw["created_at"]),
+        actor_id=str(raw["actor_id"]) if raw.get("actor_id") else None,
+        object_id=str(raw["object_id"]) if raw.get("object_id") else None,
+        activity_id=str(raw["activity_id"]) if raw.get("activity_id") else None,
+        read_at=_parse_dt(raw["read_at"]) if raw.get("read_at") else None,
+        suppressed=bool(raw.get("suppressed", False)),
     )
 
 

@@ -1,0 +1,35 @@
+{% extends "layout.html" %}
+{% block title %}{{ relationship.actor.display_name }} · remote author{% end %}
+{% block page_content %}
+<header class="page-heading">
+  <p class="eyebrow">Remote author</p>
+  <h1>{{ relationship.actor.display_name }}</h1>
+  <p>
+    <code>@{{ relationship.actor.preferred_username }}@{{ relationship.actor.domain }}</code>
+    · <a href="{{ relationship.actor.id }}" rel="noopener noreferrer">Canonical actor <span aria-hidden="true">↗</span></a>
+  </p>
+  <p aria-label="Relationship state">
+    Outbound: <strong>{{ relationship.outbound_state }}</strong> ·
+    Inbound: <strong>{{ relationship.inbound_state }}</strong>
+    {% if relationship.friend %} · Friend{% endif %}
+    {% if relationship.muted %} · Muted locally{% endif %}
+    {% if relationship.unavailable %} · Unavailable{% endif %}
+  </p>
+</header>
+<section class="content-feed" aria-labelledby="remote-posts">
+  <h2 id="remote-posts">Posts from this origin</h2>
+  {% if not feed_entries %}<p class="empty-state">No cached posts from this author.</p>{% end %}
+  {% for entry in feed_entries %}
+  <article class="content-card status-{{ entry.status }}">
+    <p class="eyebrow"><time datetime="{{ entry.published_at.isoformat() }}">{{ entry.published_at.strftime("%Y-%m-%d %H:%M") }}</time> · {{ entry.status }}</p>
+    <h3>{{ entry.summary }}</h3>
+    {% if entry.status == "tombstone" %}
+      <p class="notice">Deleted remotely.</p>
+    {% else %}
+      <div class="prose"><p>{{ entry.content_text }}</p></div>
+    {% endif %}
+    <p><a href="{{ entry.canonical_url }}" rel="noopener noreferrer">Canonical object <span aria-hidden="true">↗</span></a></p>
+  </article>
+  {% end %}
+</section>
+{% end %}

@@ -116,6 +116,22 @@ circle eligibility, cancels queued work, and restores no relationship when undon
 friends, and circles are access-control intentions—not encryption, DRM, or remote revocation—and
 the preview names exact recipients before restricted publication.
 
+
+## Chronological feed and interactions
+
+Signed-in owners get a deterministic home feed at `/home`: local public and local-only posts
+plus supported remote Notes/Articles/Images from active Following relationships, ordered by
+trusted `published` time with actor/object tie-breaks. Reposts appear as distinct events.
+Updates edit content in place without bumping position; deletes become compact tombstones;
+unavailable peers keep a stale badge on the last validated copy. Muted actors are omitted from
+the default feed and ordinary notifications; blocked actors never appear.
+
+Core actions — reply, like, undo-like, repost, undo-repost, and private bookmarks — work through
+ordinary forms and the same handlers for htmx. Notifications at `/notifications` are local
+projections only (no read receipts or push). Remote-author pages at
+`/remote/{domain}/{username}` show origin and canonical links. There is no ranking, trending, or
+centralized feed service.
+
 ## Local development
 
 ```bash
